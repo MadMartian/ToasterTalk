@@ -1,0 +1,82 @@
+@startuml ToasterTalk System Architecture
+!theme plain
+skinparam defaultTextAlignment center
+skinparam componentStyle rectangle
+
+' ── Per-stereotype component colors ───────────────────────────────────────────
+skinparam component<<agent>> {
+  BackgroundColor #D6EAF8
+  BorderColor     #2471A3
+  FontColor       #1A2D3E
+  FontStyle       bold
+}
+
+skinparam component<<server>> {
+  BackgroundColor #D5F5E3
+  BorderColor     #1E8449
+  FontColor       #145A32
+  FontStyle       bold
+}
+
+skinparam component<<cli>> {
+  BackgroundColor #EBD5F5
+  BorderColor     #6C3483
+  FontColor       #4A235A
+  FontStyle       bold
+}
+
+' ── Server rectangle ──────────────────────────────────────────────────────────
+skinparam rectangle {
+  BackgroundColor #EAF4EB
+  BorderColor     #1E8449
+  FontColor       #145A32
+  FontStyle       bold
+}
+
+' ── Database (RoomStore) ──────────────────────────────────────────────────────
+skinparam database {
+  BackgroundColor #FEF9E7
+  BorderColor     #B7950B
+  FontColor       #7D6608
+  FontStyle       bold
+}
+
+' ── Arrows & notes ────────────────────────────────────────────────────────────
+skinparam arrow {
+  Color     #555555
+  FontColor #333333
+  FontSize  11
+}
+
+skinparam note {
+  BackgroundColor #FDFEFE
+  BorderColor     #AAB7B8
+  FontColor       #444444
+  FontSize        11
+}
+
+' ── Diagram ───────────────────────────────────────────────────────────────────
+rectangle "toaster-talk-server  (systemd)" as Server {
+  component "**MCP HTTP**\n:6669\n\nPOST /mcp\nGET /sse  ·  POST /message" as HTTP  <<server>>
+  database  "**RoomStore**\n(rooms.yaml)"                                    as Store
+  component "**TTL sweeper**"                                                as Sweep <<server>>
+  component "**Mgmt**\nUnix socket"                                          as Mgmt  <<server>>
+
+  HTTP --> Store : read / write
+  HTTP --> Sweep : schedule
+}
+
+component "**Agent A**\n(e.g. \"dev\")\n~/.toaster-talk/tokens/" as AgentA <<agent>>
+component "**Agent B**\n(e.g. \"qa\")\n~/.toaster-talk/tokens/" as AgentB <<agent>>
+component "**toaster-talk-cli**\n(operator)"                 as CLI    <<cli>>
+
+AgentA <--> HTTP : Streamable HTTP  ·  MCP 2025-03-26\nor  Classic SSE  ·  MCP 2024-11-05
+AgentB <--> HTTP : Streamable HTTP  ·  MCP 2025-03-26
+CLI    -->  Mgmt : addrm · lsrm · addmb · kckm · dump · …  (10 cmds)
+
+note right of AgentA
+  Kiro, Claude Code → Streamable HTTP  (POST /mcp)
+  JetBrains Junie   → Classic SSE      (GET /sse + POST /message)
+  Seat tokens at  ~/.toaster-talk/tokens/user/<room>/<member>.tok
+end note
+@enduml

@@ -1,0 +1,55 @@
+# ToasterTalk MCP Server — Example Configuration
+# Installed at /etc/toaster-talk/config.toml by `make install`.
+# All fields are optional EXCEPT master_secret_file and [messages].member_idle_ttl_secs;
+# unset optional fields use the defaults shown here.
+#
+# Live reload: after editing this file, `systemctl reload toaster-talk` (SIGHUP)
+# re-reads it in place without dropping any agent connection. The four keys below
+# marked [restart-only] — plus master_secret_file — are bound at startup and keep
+# their running value on reload (a changed value is logged at WARN); apply those
+# with `systemctl restart`. Everything in [rooms] and [messages] reloads live.
+#
+# The same SIGHUP also re-reads rooms.yaml at store_path — hand-edit a room's or
+# seat's expiry there and `systemctl reload` picks it up without a restart. Only
+# the store_path *location* itself is restart-only.
+
+bind        = "0.0.0.0"                      # [restart-only] Listening address for MCP endpoint
+port        = 6669                            # [restart-only] MCP endpoint port
+log_level   = "info"                          # trace | debug | info | warn | error
+mgmt_socket = "/run/toaster-talk/mgmt.sock"   # [restart-only] Unix socket for toaster-talk-cli
+
+# REQUIRED. Path to the master secret file (relative to this config file's
+# directory, or absolute). The server refuses to start without it.
+# The file must contain a UTF-8 passphrase of 40–120 characters (after
+# whitespace stripping); room and seat tokens are derived from it via HMAC-SHA256.
+# Create it before first start, e.g.:
+#   sudo install -m600 -o toaster-talk /dev/null /etc/toaster-talk/master.secret
+#   head -c 48 /dev/urandom | base64 | sudo tee /etc/toaster-talk/master.secret >/dev/null
+# Treat it as a long-lived credential: rotating it invalidates every existing
+# room and seat token. (Alternatively set TOASTER_MASTER_SECRET_FILE in the
+# environment instead of this key.)
+master_secret_file = "master.secret"
+
+[rooms]
+store_path       = "/var/lib/toaster-talk/rooms.yaml"  # [restart-only location] Persisted room store — contents reload live on SIGHUP
+max_rooms        = 50                                   # Hard ceiling on active rooms
+default_ttl_days = 30                                   # Default room TTL
+max_ttl_days     = 365                                  # Hard ceiling (1 year)
+
+[messages]
+default_ttl_secs             = 660    # Default message TTL (11 minutes)
+max_ttl_secs                 = 3600   # Hard ceiling (1 hour)
+sweep_interval_secs          = 60     # How often the TTL sweeper runs
+idle_threshold_secs          = 300    # After this many seconds, last_seen is reported (must be <= member_idle_ttl_secs)
+member_idle_ttl_secs         = 1800   # REQUIRED, no default. Idle TTL for non-seat members; range 1800..=86400
+                                      #   (30 min – 24 h). Server-controlled only — agents cannot set it.
+                                      #   Absent / 0 / out-of-range is a fatal startup error.
+seat_idle_ttl_secs           = 86400  # Dead-seat reaper threshold (default 24h). A SEAT member idle this long
+                                      #   with NO active receive is reaped, closing its inbox so senders fail-closed
+                                      #   instead of black-holing messages to a dead client. A live seat parks in
+                                      #   receive and is always skipped, so this is safe. Set 0 to DISABLE (seats
+                                      #   fully exempt, the pre-reaper behavior). Independent of member_idle_ttl_secs.
+default_receive_timeout_secs = 30     # Default receive() wait when timeout_secs is omitted
+max_await_reply_secs         = 3600   # Hard ceiling on send() await_reply_secs
+max_receive_timeout_secs     = 3600   # Hard ceiling on receive() timeout_secs
+max_inbox_messages           = 100    # Per-member inbox capacity (send rejected when full)

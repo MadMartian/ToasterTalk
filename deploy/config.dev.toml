@@ -1,0 +1,38 @@
+# ToasterTalk — DEV / MANUAL-TEST instance configuration.
+#
+# This is NOT for production. It runs a throwaway instance from the repo (via
+# `make dev-up`) on port 6668, fully isolated from any systemd/production
+# instance on 6669. All mutable state lives under /tmp/toaster-talk-dev/ and
+# target/dev-instance/ (both ephemeral / gitignored).
+#
+# See toaster-talk-server/tests/MANUAL-TEST.md for the workflow.
+
+bind        = "127.0.0.1"                       # localhost only — never expose the dev instance
+port        = 6668                              # dev port (prod is 6669)
+log_level   = "debug"                           # verbose: manual tests read the logs
+mgmt_socket = "/tmp/toaster-talk-dev/mgmt.sock"
+
+# Resolved relative to THIS file's directory (deploy/), so it is cwd-independent.
+# `make dev-up` generates the key at target/dev-instance/master.key before launch.
+# (TOASTER_MASTER_SECRET_FILE, if set, overrides this.)
+master_secret_file = "../target/dev-instance/master.key"
+
+[rooms]
+store_path       = "/tmp/toaster-talk-dev/rooms.yaml"
+max_rooms        = 50
+default_ttl_days = 30
+max_ttl_days     = 365
+
+[messages]
+default_ttl_secs     = 1200
+max_ttl_secs         = 3600
+# Fast sweeps so idle/seat-TTL scenarios (MT-4) run in seconds, not minutes.
+sweep_interval_secs  = 5
+idle_threshold_secs  = 60
+member_idle_ttl_secs = 1800   # floor of the allowed range (30 min); non-seat members
+
+# Dead-seat reaper threshold. SHORT here (prod default is 24h) so MT-4 is testable
+# in ~seconds. A seat with no active receive, idle past this, is reaped (inbox
+# closed). 0 would disable it. The reaper sweep is LIVE on this branch — at 15s it
+# reaps idle probe seats mid-scenario, so keep connect→first-use tight in MT-5/MT-6.
+seat_idle_ttl_secs   = 15

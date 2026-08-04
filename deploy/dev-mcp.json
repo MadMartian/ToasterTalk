@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ToasterTalkDev": {
+      "type": "sse",
+      "url": "http://localhost:6668/sse"
+    }
+  }
+}

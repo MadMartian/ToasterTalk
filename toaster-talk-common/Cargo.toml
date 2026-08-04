@@ -1,0 +1,12 @@
+[package]
+name = "toaster-talk-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared types and helpers for the ToasterTalk MCP server and CLI"
+
+[lib]
+name = "toaster_talk_common"
+path = "src/lib.rs"

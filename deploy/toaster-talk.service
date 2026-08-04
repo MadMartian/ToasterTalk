@@ -1,0 +1,36 @@
+[Unit]
+Description=ToasterTalk MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=toaster-talk
+Group=operator
+
+ExecStart=/usr/local/bin/toaster-talk-server --config /etc/toaster-talk/config.toml
+# `systemctl reload toaster-talk` re-reads the config in place without restarting:
+# SIGHUP makes the server re-resolve config.toml (+ env/CLI) and hot-swap the
+# tunable keys, so live MCP connections and sessions are never dropped. The same
+# SIGHUP also re-reads rooms.yaml at store_path, so a hand-edited room/seat expiry
+# takes effect too. Restart-only fields (bind, port, mgmt_socket, the store_path
+# *location* itself, master_secret) keep their startup value on reload and a
+# changed value is logged at WARN — apply those with a full `systemctl restart`.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+Environment=RUST_LOG=info
+
+# systemd creates these directories with correct ownership before the process
+# starts, eliminating any need for the server to mkdir at runtime.
+#
+# /run/toaster-talk/   — mgmt socket (mode 0750 so operator group can enter)
+# /var/lib/toaster-talk/ — room store
+# /etc/toaster-talk/   — config (pre-existing; listed here for documentation)
+RuntimeDirectory=toaster-talk
+RuntimeDirectoryMode=0750
+StateDirectory=toaster-talk
+StateDirectoryMode=0700
+ConfigurationDirectory=toaster-talk
+ConfigurationDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

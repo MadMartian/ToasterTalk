@@ -1,0 +1,6 @@
+.idea
+/target
+reviews/
+docs/
+.claude/
+git.commit.txt

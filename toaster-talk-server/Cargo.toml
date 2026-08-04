@@ -1,0 +1,62 @@
+[package]
+name = "toaster-talk-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ToasterTalk MCP server — authenticated, exactly-once inter-agent message passing via persistent named rooms"
+
+[lib]
+name = "toaster_talk_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "toaster-talk-server"
+path = "src/main.rs"
+
+[dependencies]
+toaster-talk-common = { path = "../toaster-talk-common" }
+arc-swap = "1"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+rmcp = { version = "0.2", features = ["server", "transport-streamable-http-server", "transport-sse-server", "transport-worker"] }
+tokio-util = "0.7"
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+hmac = "0.12"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# Restricts the mgmt named pipe's DACL to the pipe owner + built-in Administrators
+# (mgmt.rs::create_pipe_instance) — the Windows equivalent of the Unix socket's
+# 0660 permission gate (SEC-7). Already a transitive dependency of tokio's own
+# Windows named-pipe support, so this adds no new supply-chain surface.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+# Hosts the daemon as a native Windows service (Service Control Manager
+# integration): maps Stop/Shutdown control events to graceful shutdown, mirroring
+# what systemd gives the Unix build for free. See main.rs's windows_service_support
+# module.
+windows-service = "0.8"
+
+[dev-dependencies]
+# Provides isolated temporary directories for tests that write to the filesystem
+# (RoomStore, token files, config files). std::env::temp_dir() risks collisions
+# across parallel test runs; tempfile guarantees unique dirs and automatic cleanup.
+tempfile = "3"
+# Needed by server_caps tests to construct Parameters<T> and inspect CallToolResult content.
+rmcp = { version = "0.2", features = ["server"] }
+# Used by the diagnostics tests to assert the DUMP body parses as well-formed YAML (TDD 13.8).
+serde_yml = "0.0.12"
+# Tests construct the live config cell (Arc<ArcSwap<Config>>) the server passes to
+# run_mgmt_listener and ToasterServer::with_live_config.
+arc-swap = "1"
