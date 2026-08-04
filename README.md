@@ -3,19 +3,19 @@
 [![CI](https://github.com/MadMartian/ToasterTalk/actions/workflows/ci.yml/badge.svg)](https://github.com/MadMartian/ToasterTalk/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A reliable MCP server for inter-agent communication — lets Claude Code agents exchange messages without the deadlocks, message theft, and silent loss that plague named-pipe approaches.
+A reliable MCP server for inter-agent communication — persistent, authenticated rooms where AI agents exchange messages with exactly-once delivery, across terminals, machines, and platforms.
 
 ## What it does
 
-AI agents running in separate terminal sessions can send and receive messages through a shared daemon instead of fighting over filesystem pipes. Rooms are persistent, authenticated spaces where N agents meet under a shared token. Messages are queued server-side and delivered exactly once — no rogue processes can steal them. Every blocking operation has a mandatory timeout, so agents can never deadlock waiting for each other indefinitely.
+AI agents running in separate terminal sessions — or on separate machines — send and receive messages through a shared daemon. Rooms are persistent, authenticated spaces where N agents meet under a shared token. Messages are queued server-side and delivered exactly once, each only to the member it was addressed to. Every blocking operation has a mandatory timeout, so agents can never deadlock waiting for each other indefinitely.
 
 The usual way to divvy up work — spawning sub-agents — stops at the machine boundary: a coordinator can't spawn a sub-agent on another box. ToasterTalk makes agents on different machines and platforms first-class peers instead: an agent on a Linux workstation can confer with one on a Windows machine working the same project, over nothing more than HTTP to the shared daemon.
 
 ## Features
 
-- **No more deadlocks**: message TTLs and mandatory tool timeouts make indefinite blocking structurally impossible
-- **Exactly-once delivery**: messages are queued on the server — no fd races, no silent discard on fire-and-forget
-- **Rooms, not pipes**: persistent named rooms support any number of members; one shared token gets everyone in
+- **Deadlock-free by construction**: message TTLs and mandatory tool timeouts make indefinite blocking structurally impossible
+- **Exactly-once delivery**: messages are queued on the server until their recipient collects them — never dropped, never duplicated, never handed to the wrong peer
+- **Persistent rooms**: named rooms support any number of members; one shared token gets everyone in
 - **Cross-machine, cross-platform**: agents on different hosts and OSes coordinate as peers — where sub-agent hierarchies can't reach past their own machine
 - **Fire-and-forget or round-trip**: send without waiting, or block until the peer replies — one tool handles both
 - **Staleness awareness**: every delivered message includes its queue age; tool responses flag members who haven't been seen recently, and crashed agents don't linger as phantoms — non-seat members are reaped after a server-configured idle TTL, and a dead seat (idle past a generous dead-seat window with no active receive) is reaped too so its inbox stops black-holing messages. A seat holder rejoins with the same name and reserved credential at any time, and messages queued while it was briefly away are carried over on reconnect
@@ -76,8 +76,6 @@ Get-Service ToasterTalk
 `install.ps1` writes a default config and generates a master secret under `%ProgramData%\ToasterTalk` on first run.
 
 > **Changed a setting?** Edit `config.toml` and run `sudo systemctl reload toaster-talk` (Linux/macOS) or `toaster-talk-cli reload` (any platform, including Linux/macOS) — the daemon re-reads its tunable settings (message/room TTLs, timeouts, inbox cap, log level, …) in place **without dropping any agent connection**. The same reload also re-reads `rooms.yaml`, so a hand-edited room/seat expiry takes effect too. A few fields are restart-only (`bind`, `port`, `mgmt_socket`, the `store_path` *location* itself, `master_secret`) and need a full restart; a reload that changes one keeps the running value and logs a warning.
-
-> **Upgrading an existing install?** `[messages].member_idle_ttl_secs` is now **required** (no default; range `1800`–`86400` seconds). Fresh installs get it from the example config, but an existing `config.toml` must add it or the server will refuse to start.
 
 ### 2. Create a room
 
