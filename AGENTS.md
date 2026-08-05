@@ -78,4 +78,3 @@ exceptionally long one. Concretely:
 
 - `sdd/ISSUES.md` — Known unresolved issues (9 open). Read when investigating unexpected behaviour or before touching transport, auth, or receive.
 - `sdd/PLAN.broadcast.md` — Deferred design for broadcast and multi-consumer rooms. Read before adding any fanout or multi-recipient capability.
-- `sdd/PLAN.multi-receive.md` — Design rationale for the implemented connect/join split and multi-room `receive`/`send` (one session token per agent instead of per room, one shared inbox, room-filtered waits). Read before touching `connect`, `join`, `send`, `receive`, session/eviction handling, or any multi-room capability — it documents the reasoning and rejected alternatives behind the current implementation, not a pending change.

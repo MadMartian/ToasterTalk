@@ -13,12 +13,11 @@ pub struct RosterResult {
 
 /// List the members of a room the caller's session belongs to (TDD 5.3).
 ///
-/// A session can now belong to more than one room (PLAN.multi-receive.md), so the
-/// old equality check ("the session's one room must match `room_name`") becomes a
-/// set-membership check: is `room_name` one of the rooms this session has joined?
-/// A room the caller has not joined is rejected with `NotConnectedToRoom` rather
-/// than silently listing it — there is no way to inspect a room the caller is not
-/// itself a member of.
+/// A session can belong to more than one room, so this is a set-membership check
+/// (is `room_name` one of the rooms this session has joined?), not equality against
+/// a single resolved room. A room the caller has not joined is rejected with
+/// `NotConnectedToRoom` rather than silently listing it — there is no way to
+/// inspect a room the caller is not itself a member of.
 pub async fn handle_members(
     app: &SharedAppState,
     store: &Arc<RwLock<RoomStore>>,

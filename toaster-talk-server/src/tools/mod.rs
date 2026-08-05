@@ -50,10 +50,10 @@ pub struct InboxMessage {
     pub id: Uuid,
     pub from: String,
     /// Display name of the room this message was sent in. Every delivered message
-    /// carries this now that one session's shared inbox can hold traffic from
-    /// several rooms at once (PLAN.multi-receive.md) — the recipient always knows
-    /// where a message came from, even when `receive`'s room filter is omitted
-    /// and messages from several rooms are returned together (TDD 3.10).
+    /// carries this because one session's shared inbox can hold traffic from
+    /// several rooms at once — the recipient always knows where a message came
+    /// from, even when `receive`'s room filter is omitted and messages from
+    /// several rooms are returned together (TDD 3.10).
     pub room: String,
     pub body: String,
     /// Human-readable time the message spent waiting in the queue, e.g. "2 minutes in queue".

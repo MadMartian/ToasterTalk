@@ -15,19 +15,18 @@ pub struct ConnectResult {
 /// `connect` takes at most one optional input, `old_session_token`, and nothing
 /// else: no room token, no seat token, no member name, ever. Every room
 /// membership an agent ever holds — including its very first — is created
-/// through `join`, not `connect` (PLAN.multi-receive.md's connect/join split).
+/// through `join`, not `connect`.
 ///
 /// - No `old_session_token`: mints a fresh, roomless session token. Nothing to
 ///   register, nothing to evict (TDD 1a.1, 1a.2).
 /// - `old_session_token` supplied and still valid: invalidates that session —
 ///   and *every* room membership under it — immediately, and mints a fresh,
-///   roomless token in its place (TDD 1a.4). This is deliberate: a bearer-only
-///   `session_token` presentation must never be sufficient, by itself, to
-///   recover any room — recovery always goes back through `join`, using the
-///   room or seat token the agent still holds (see PLAN.multi-receive.md's
-///   skeleton-key decision). A stale/unrecognized `old_session_token` is not an
-///   error — it is simply ignored, since it names nothing worth invalidating and
-///   a fresh mint is issued regardless.
+///   roomless token in its place (TDD 1a.4). Deliberate no-carryover: a
+///   bearer-only `session_token` presentation must never be sufficient, by
+///   itself, to recover any room — recovery always goes back through `join`,
+///   using the room or seat token the agent still holds. A stale/unrecognized
+///   `old_session_token` is not an error — it is simply ignored, since it names
+///   nothing worth invalidating and a fresh mint is issued regardless.
 pub async fn handle_connect(
     app: &SharedAppState,
     old_session_token: Option<String>,

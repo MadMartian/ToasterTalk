@@ -1063,9 +1063,7 @@ async fn test_seat_reconnect_transfers_queued_messages() {
 /// TDD 1a.4: rotating a session via `connect`'s `old_session_token` invalidates
 /// the old session (and its room membership) immediately, and does NOT carry over
 /// queued messages or the room membership — recovery goes back through `join`.
-/// This replaces the old (pre-connect/join-split) room-token reconnect-carryover
-/// test: that specific path no longer exists, since `connect` never touches room
-/// state at all now (see PLAN.multi-receive.md's skeleton-key decision).
+/// `connect` never touches room state; bearer-only rotation must not recover rooms.
 #[tokio::test]
 async fn test_connect_old_session_token_does_not_carry_over_queued_messages() {
     let dir = TempDir::new().unwrap();

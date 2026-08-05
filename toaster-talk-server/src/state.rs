@@ -51,10 +51,10 @@ pub struct QueuedMessage {
     pub from: MemberName,
     /// The room this message was sent in — the token, not the display name (the
     /// display name lives only in `RoomStore`; callers resolve it for the wire
-    /// response). Every message carries this now that one session's inbox can be
-    /// shared across several rooms (PLAN.multi-receive.md): it is both the tag a
-    /// `receive`/send-with-reply room filter matches against, and the basis for
-    /// tagging each delivered message with the room it came from (TDD 3.10).
+    /// response). Every message carries this because one session's inbox can be
+    /// shared across several rooms: it is both the tag a `receive`/send-with-reply
+    /// room filter matches against, and the basis for tagging each delivered
+    /// message with the room it came from (TDD 3.10).
     pub room: RoomToken,
     pub body: String,
     pub enqueued_at: Instant,
@@ -70,8 +70,8 @@ pub struct QueuedMessage {
 // ── Inbox ─────────────────────────────────────────────────────────────────────
 
 /// Each session's private message queue — shared across every room membership
-/// that session holds (PLAN.multi-receive.md): one agent, however many rooms it
-/// has joined, drains one inbox.
+/// that session holds: one agent, however many rooms it has joined, drains one
+/// inbox.
 ///
 /// Uses a `Mutex<VecDeque>` rather than `mpsc` so that senders (`try_push`), the
 /// send-with-reply reply-wait, and the `receive` handler can all access the queue
@@ -187,8 +187,7 @@ impl Inbox {
     /// Drain all messages that have not yet expired **and** whose room tag
     /// satisfies `filter`. A still-valid message that does not match `filter` is
     /// left queued, not dropped — this is the primitive behind `receive`'s
-    /// optional room filter and send-with-reply's mandatory one
-    /// (PLAN.multi-receive.md's "genuinely new primitive").
+    /// optional room filter and send-with-reply's mandatory one.
     pub async fn drain_valid_filtered(
         &self,
         now: Instant,
@@ -430,7 +429,7 @@ impl Drop for ReplyWaitGuard {
 
 /// One room membership. A session that belongs to N rooms has N `MemberState`
 /// entries (one per `RoomState`), but every one of them shares the *same*
-/// `inbox: Arc<Inbox>` — the session's one shared mailbox (PLAN.multi-receive.md).
+/// `inbox: Arc<Inbox>` — the session's one shared mailbox.
 pub struct MemberState {
     pub session_token: SessionToken,
     // Stored for diagnostics and future LIST-MEMBERS command
@@ -442,7 +441,7 @@ pub struct MemberState {
     /// Updated on every tool call that touches *this* room membership. Read to
     /// compute `last_seen` duration. Stays per-room-membership, never promoted to
     /// the session as a whole, so an idle room is still reaped even while the
-    /// agent is actively working in another (Decided, PLAN.multi-receive.md).
+    /// agent is actively working in another.
     pub last_seen: Instant,
     /// How this membership authenticated. Fixed for the membership's lifetime; the
     /// idle TTL sweep exempts a member iff `auth == AuthMethod::Seat`.
@@ -608,7 +607,7 @@ impl AppState {
 
     /// Mint a brand-new, roomless session: registers an empty membership set and
     /// a fresh shared inbox. This is `connect`'s entire job — no room or seat
-    /// credential involved (PLAN.multi-receive.md).
+    /// credential involved.
     pub fn register_session(&mut self, session_token: SessionToken) -> Arc<Inbox> {
         let inbox = Inbox::new();
         self.sessions.insert(session_token.clone(), HashSet::new());
@@ -669,11 +668,11 @@ impl AppState {
     /// from its `RoomState`, the session-map entry and shared inbox are removed,
     /// and the inbox is aborted/closed. This is the one place a session is
     /// invalidated wholesale regardless of how many rooms remain — `connect`'s
-    /// `old_session_token` rotation path (see PLAN.multi-receive.md's
-    /// skeleton-key decision and TDD 1a.4). Ordinary per-room eviction
-    /// (idle TTL, `kckm`, room expiry, seat supersede) never calls this; it goes
-    /// through [`AppState::evict_member`] and friends, which only tear down the
-    /// whole session when the *last* membership is the one being removed.
+    /// `old_session_token` rotation path (TDD 1a.4). No room/inbox carryover:
+    /// bearer-only token presentation must not recover rooms. Ordinary per-room
+    /// eviction (idle TTL, `kckm`, room expiry, seat supersede) never calls this;
+    /// it goes through [`AppState::evict_member`] and friends, which only tear
+    /// down the whole session when the *last* membership is the one being removed.
     pub async fn invalidate_session_fully(&mut self, session_token: &str) {
         let Some(memberships) = self.sessions.remove(session_token) else {
             return;
@@ -1064,12 +1063,12 @@ impl AppState {
     /// during a long wait would read as instantly idle-reapable the moment the
     /// wait ends, even though the agent was genuinely parked and alive the whole
     /// time (the same trap TDD 10.19 already guards against for the single-room
-    /// case). This does not violate the per-room idle-TTL granularity decision
-    /// (PLAN.multi-receive.md "Decided"): each room's `last_seen` field is still
-    /// tracked independently — a room-*filtered* receive still only touches its
-    /// one target room (see [`AppState::touch_membership`]) — this is specific to
-    /// the room-omitted call shape, which by definition represents activity
-    /// across every room it was capable of waking for.
+    /// case). This does not violate per-room idle-TTL granularity: each room's
+    /// `last_seen` field is still tracked independently — a room-*filtered*
+    /// receive still only touches its one target room (see
+    /// [`AppState::touch_membership`]) — this is specific to the room-omitted
+    /// call shape, which by definition represents activity across every room it
+    /// was capable of waking for.
     pub fn touch_all_memberships(&mut self, session_token: &str) {
         let Some(set) = self.sessions.get(session_token).cloned() else {
             return;
@@ -1235,10 +1234,8 @@ impl AppState {
 
             // Structural baseline: `session_inboxes` holds one clone, and every
             // room membership sharing this inbox (`MemberState.inbox`) holds
-            // another. This is strictly larger than the old single-room model's
-            // baseline of 1 (MemberState only) now that the inbox is shared
-            // (PLAN.multi-receive.md) — a session with two rooms legitimately
-            // shows strong_count 3 with nobody parked and nothing orphaned.
+            // another — a session with two rooms legitimately shows strong_count
+            // 3 with nobody parked and nothing orphaned.
             let baseline = 1 + memberships_set.len();
 
             if snap.receive_active && snap.arc_strong_count <= baseline {

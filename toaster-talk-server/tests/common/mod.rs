@@ -66,9 +66,9 @@ pub async fn create_room(store: &Arc<RwLock<RoomStore>>, name: &str) -> String {
 }
 
 /// Connect (mint a fresh, roomless session) and then join `room_token` as
-/// `member` — the two-step flow every room membership now goes through
-/// (PLAN.multi-receive.md). Kept under the historical name `join` since nearly
-/// every integration test uses it purely as "get me a session in this room."
+/// `member` — the two-step flow every room membership goes through. Kept under
+/// the historical name `join` since nearly every integration test uses it purely
+/// as "get me a session in this room."
 pub async fn join(
     app: &SharedAppState,
     store: &Arc<RwLock<RoomStore>>,

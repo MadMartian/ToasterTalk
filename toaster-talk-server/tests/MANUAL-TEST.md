@@ -77,16 +77,16 @@ driven by the probe brief below are proven to work and sidestep all three.
 
 ### Note: connect/join split (read before running any scenario below)
 
-As of the multi-receive change (PLAN.multi-receive.md), `connect` is a pure
-identity mint — it takes at most `old_session_token` and never a room/seat
-token or member name. Every room membership, including a probe's very first, is
-created by a separate `join` call: `join` with `session_token` + `seat_token` +
-`member_name` (or `room_token` + `member_name`). Wherever the scenarios below
-say a probe "connects (seat)", read that as **connect (mint a session token)
-then join with the seat token** — two calls, not one. Wherever they say a probe
-"reconnects (connect again with its seat → supersede)", read that as:
-**connect fresh (roomless, no `old_session_token` — the seat token itself
-proves identity) then join again with the same seat token** — the `join`
+`connect` is a pure identity mint — it takes at most `old_session_token` and
+never a room/seat token or member name. Every room membership, including a
+probe's very first, is created by a separate `join` call: `join` with
+`session_token` + `seat_token` + `member_name` (or `room_token` +
+`member_name`). Wherever the scenarios below say a probe "connects (seat)",
+read that as **connect (mint a session token) then join with the seat token** —
+two calls, not one. Wherever they say a probe "reconnects (connect again with
+its seat → supersede)", read that as: **connect fresh (roomless, no
+`old_session_token` — the seat token itself proves identity) then join again
+with the same seat token** — the `join`
 seat-token branch is what unconditionally evicts and supersedes the prior
 holder, exactly as `connect`'s seat path used to. `connect`'s `old_session_token`
 is a different thing now: it rotates and *invalidates* an existing session

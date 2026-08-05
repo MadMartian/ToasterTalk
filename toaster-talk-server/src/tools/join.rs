@@ -21,8 +21,7 @@ pub struct JoinResult {
 ///   never silently mints a session (TDD 1b.2, 1b.6).
 /// - The desired member name already held by a *different* session in this room:
 ///   `MemberNameTaken` (TDD 1b.3). There is no `old_session_token` escape hatch
-///   here — that concept lives solely on `connect` now, and no longer carries
-///   room state (see PLAN.multi-receive.md).
+///   here — that concept lives solely on `connect`, and never carries room state.
 /// - The caller's own session already belongs to this room: rejected as
 ///   redundant with `AlreadyJoinedRoom`, not treated as a no-op (TDD 1b.7).
 pub async fn handle_join_room_token(

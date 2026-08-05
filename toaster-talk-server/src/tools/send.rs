@@ -31,8 +31,8 @@ pub struct SendResult {
 /// Send a message to a named member in the same room.
 ///
 /// `room_name` is required (TDD 2.4, 2.5, 2.6) — recipient `to` alone no longer
-/// disambiguates which room's namespace to search, now that one session's shared
-/// inbox can span several rooms (PLAN.multi-receive.md).
+/// disambiguates which room's namespace to search, since one session's shared
+/// inbox can span several rooms.
 ///
 /// Two modes:
 /// - Fire-and-forget: enqueues and returns immediately. Strictly one-way — it never
@@ -202,10 +202,9 @@ pub async fn handle_send(
     // read the send response, since the drain removed them from the inbox.
     //
     // Send-with-reply: block on sender's own inbox — filtered to THIS room only,
-    // the mandatory counterpart of receive's optional room filter (PLAN.multi-
-    // receive.md) — while also watching the recipient's inbox so the wait abandons
-    // promptly (rather than draining the full timeout) if the recipient is evicted
-    // before replying.
+    // the mandatory counterpart of receive's optional room filter — while also
+    // watching the recipient's inbox so the wait abandons promptly (rather than
+    // draining the full timeout) if the recipient is evicted before replying.
     let (reply_messages, reply_preempted) = if let Some(reply_timeout_secs) = effective_await_secs {
         wait_for_messages(
             sender_inbox.clone(),

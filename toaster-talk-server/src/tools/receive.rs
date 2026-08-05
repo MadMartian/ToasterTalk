@@ -77,8 +77,8 @@ pub(crate) struct ParkOutcome {
 ///
 /// `filter` is the room-scoping predicate: `receive`'s optional room filter and
 /// send-with-reply's mandatory one are both just predicates passed here — this is
-/// *not* a new preemption model (PLAN.multi-receive.md): still one inbox, one slot,
-/// one live waiter, same chokepoint as before. Pass `|_| true` for "any room."
+/// *not* a new preemption model: still one inbox, one slot, one live waiter, same
+/// chokepoint. Pass `|_| true` for "any room."
 pub(crate) async fn park_on_inbox(
     inbox: Arc<Inbox>,
     deadline: Instant,

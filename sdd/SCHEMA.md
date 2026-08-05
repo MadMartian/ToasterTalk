@@ -24,16 +24,15 @@ with `join`'s `member_name`/`room_token`) is rejected with a structured
 validation error rather than having the unrecognized field silently discarded.
 This is cross-cutting and not repeated per tool below.
 
-One `session_token` is shared across every room an agent has joined
-(PLAN.multi-receive.md): `connect` mints the identity, `join` attaches each room
-membership to it. **`session_token` is credential-grade** — because it now
-resolves to every room the session belongs to (not just one), a leaked token
-lets whoever holds it attach to any of those rooms via `join`, given their own
-room/seat credential. Treat it with the same care as a persisted secret for
-however long it lives: never log it in full, never paste it insecurely. Its
-*lifecycle* is unchanged (minted once per `connect` episode, reused across that
-session's calls, invalidated on eviction/rotation) — only the *consequence* of a
-leak during that lifetime is larger now.
+One `session_token` is shared across every room an agent has joined: `connect`
+mints the identity, `join` attaches each room membership to it.
+**`session_token` is credential-grade** — because it resolves to every room the
+session belongs to (not just one), a leaked token lets whoever holds it attach
+to any of those rooms via `join`, given their own room/seat credential. Treat it
+with the same care as a persisted secret for however long it lives: never log it
+in full, never paste it insecurely. Its *lifecycle* is short (minted once per
+`connect` episode, reused across that session's calls, invalidated on
+eviction/rotation) — short-lived is not the same as safe-to-expose.
 
 ### `connect`
 
@@ -158,7 +157,7 @@ by `format_messages_yaml` from an `InboxMessage`.
 |-------|------|----------|-------------|
 | `id` | `uuid` | no | Message id. |
 | `from` | `string` | no | Sender's member name (room-scoped — the sender may use a different name in other rooms). Reply by `send`ing back to this name, in this same `room`. |
-| `room` | `string` | no | The room this message was sent in. Present on every message now that one session's shared inbox can hold traffic from several rooms at once (PLAN.multi-receive.md) — always enough context to reply into the right room even when a `receive` with no room filter returns messages from several rooms in one batch. |
+| `room` | `string` | no | The room this message was sent in. Present on every message because one session's shared inbox can hold traffic from several rooms at once — always enough context to reply into the right room even when a `receive` with no room filter returns messages from several rooms in one batch. |
 | `age` | `string` | no | Human-readable time spent queued, e.g. `"2 minutes in queue"`. |
 | `reply_expected_within_secs` | `u64` | yes | Present **only** when the sender issued a send-with-reply (`await_reply_secs`). Seconds remaining in the sender's reply window as of delivery; counts down as the message sits queued and saturates to `0` once closed. Its presence *is* the signal that a reply is expected. Advisory intent stamped at send time — not a live guarantee the sender is still parked. |
 | `body` | `string` | no | Message body, rendered as a YAML block scalar (`\|`). Always last (the block scalar consumes following lines). |

@@ -20,7 +20,7 @@ The batch size at `receive` time is still unbounded — all queued messages are 
 - Cap the number of messages returned per `receive` call (e.g. max 100), with a continuation token for the remainder
 - Cap the total byte size of a single `receive` response
 
-**Multi-receive note (PLAN.multi-receive.md):** one session's inbox is now shared across every room it has joined, with one `max_inbox_messages` budget for all of them combined (not one budget per room). This does not multiply the exposure above — an N-room session still has exactly one inbox and one cap, same as before — but it introduces a new **cross-room noisy-neighbor** effect: a chatty room A can fill the shared budget and cause `InboxFull` rejections for an unrelated room B's senders, which could not happen when each room had its own independent inbox. Worth factoring into any future per-`receive`-call cap design.
+One session's inbox is shared across every room it has joined, with one `max_inbox_messages` budget for all of them combined (not one budget per room). That does not multiply the exposure above — an N-room session still has exactly one inbox and one cap — but it introduces a **cross-room noisy-neighbor** effect: a chatty room A can fill the shared budget and cause `InboxFull` rejections for an unrelated room B's senders. Worth factoring into any future per-`receive`-call cap design.
 
 ---
 
@@ -34,7 +34,7 @@ The server currently speaks plain HTTP. Room tokens and session tokens are trans
 
 **Resolution**: Add HTTPS support with operator-supplied certificate, or support a TLS-terminating reverse proxy (e.g. nginx). Document the recommended setup for network deployments.
 
-**Multi-receive note (PLAN.multi-receive.md):** `session_token` is now credential-grade in a stronger sense than before — a captured token exposes every room the session belongs to (via `join`, given the attacker's own room/seat credential), not just one. A plaintext-transport capture is therefore a bigger prize than it used to be; this raises (does not lower) the urgency of resolving this issue for any non-localhost deployment.
+`session_token` is credential-grade: a captured token exposes every room the session belongs to (via `join`, given the attacker's own room/seat credential), not just one. A plaintext-transport capture is therefore a bigger prize; this raises the urgency of resolving this issue for any non-localhost deployment.
 
 ---
 
@@ -78,22 +78,15 @@ Rotating the master secret (e.g. after a suspected compromise) invalidates all r
 
 ---
 
-## ISS-008 — Connect/delete TOCTOU windows can register sessions against a deleted room
+## ISS-008 — Join/delete TOCTOU windows can register memberships against a deleted room
 
 **Area**: Concurrency
 **Severity**: Negligible (NV)
 **Status**: Open — documented, accepted
 
-Both connect paths verify the room/seat token under a `RoomStore` read lock, release it, then acquire the `AppState` write lock to register the member. A concurrent deletion in that window can register a session against a room or seat that no longer exists in the store:
-
-- **NV-A** (`handle_connect_seat`): a concurrent `DELMB` deletes the seat after it is verified.
-- **NV-B** (`handle_connect`): a concurrent `DELRM` deletes the room after the room token is verified.
-
-In both cases the resulting session is harmless: it is evicted on the next TTL sweep or when the room/seat is recreated, and no external party can enter the window without a valid token. The two windows are flagged inline in `tools/connect.rs`.
+Both `join` paths (room-token and seat-token) verify the credential under a `RoomStore` read lock, release it, then acquire the `AppState` write lock to register the membership. A concurrent deletion in that window can attach a membership against a room or seat that no longer exists in the store. The window lives entirely on `join` (`tools/join.rs`) — the only tool that ever registers a room membership — and recurs once per room a session joins. Shape and severity are negligible: the resulting membership is harmless (evicted on the next TTL sweep or when the room/seat is recreated), self-healing, and still requires a pre-existing valid credential to enter.
 
 **Resolution (optional)**: Re-verify room/seat existence under the `AppState` write lock by re-reading the store, accepting the extra lock round-trip. Not currently judged worth the cost.
-
-**Multi-receive note (PLAN.multi-receive.md):** this TOCTOU window now belongs entirely to `join` (`tools/join.rs`) — the only tool that ever registers a room membership, since `connect` no longer takes a room/seat credential at all. It recurs once per room a session joins rather than once per session, but the shape and severity (negligible, self-healing, still requires a pre-existing valid credential to enter) are unchanged.
 
 ---
 
@@ -136,7 +129,7 @@ A seat token *is* the member identity — the server cannot distinguish the legi
 
 Prevention: ensure each seat file is held by exactly one agent. If a rogue agent must stay in the room, give it its **own** seat (`addmb <room> <other-name>`) and have it reconnect under that distinct member name — never share one seat across two live agents.
 
-**Multi-receive note (PLAN.multi-receive.md):** eviction is now per-room-membership rather than per-session, which gives this issue a small incidental improvement: a seat fight over one room's membership (`join`'s seat-token collision path) no longer collaterally evicts the victim's other, unrelated live room memberships under the same session — only the contended room thrashes. The core livelock (two agents sharing one seat credential) is otherwise unchanged.
+Eviction is per-room-membership rather than whole-session, so a seat fight over one room (`join`'s seat-token collision path) no longer collaterally evicts the victim's other live room memberships under the same session — only the contended room thrashes. The core livelock (two agents sharing one seat credential) is otherwise unchanged.
 
 ---
 
