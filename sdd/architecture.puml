@@ -56,7 +56,7 @@ skinparam note {
 }
 
 ' ── Diagram ───────────────────────────────────────────────────────────────────
-rectangle "toaster-talk-server  (systemd)" as Server {
+rectangle "toaster-talk-server  (system service)" as Server {
   component "**MCP HTTP**\n:6669\n\nPOST /mcp\nGET /sse  ·  POST /message" as HTTP  <<server>>
   database  "**RoomStore**\n(rooms.yaml)"                                    as Store
   component "**TTL sweeper**"                                                as Sweep <<server>>

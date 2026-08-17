@@ -26,7 +26,7 @@ The usual way to divvy up work — spawning sub-agents — stops at the machine 
 
 | Requirement | Details |
 |---|---|
-| OS | Linux, macOS, or Windows — native service integration on all three (systemd / Windows Service Control Manager) |
+| OS | Linux, macOS, or Windows — native service integration on all three (systemd / launchd / Windows Service Control Manager) |
 | Rust | 1.75+ stable |
 | Claude Code | MCP HTTP transport support |
 
@@ -39,7 +39,7 @@ cd ToasterTalk
 
 ### 1. Install and start the daemon
 
-**Linux / macOS:**
+**Linux:**
 
 ```bash
 # Build as your normal user (cargo must be in PATH)
@@ -55,7 +55,26 @@ sudo systemctl enable --now toaster-talk
 systemctl status toaster-talk
 ```
 
-`make install` creates the `toaster-talk` system account if it does not exist. Members of the `operator` group can run `toaster-talk-cli` without `sudo`.
+`make install` creates the `toaster-talk` system account if it does not exist, and generates a master secret at `/etc/toaster-talk/master.secret` on first run. Members of the `operator` group can run `toaster-talk-cli` without `sudo`.
+
+**macOS:**
+
+```bash
+make build
+
+# Installs binaries, config, master secret, and a launchd daemon
+sudo make install
+
+# Start it (and enable at boot)
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.toaster-talk.plist
+
+# Verify it's running
+sudo launchctl list | grep toaster-talk
+```
+
+`make install` detects Darwin and takes the launchd path automatically — same target, no extra flags. It generates a master secret at `/etc/toaster-talk/master.secret` if none exists, and logs to `/var/log/toaster-talk.log`. The daemon runs as **root**, so `toaster-talk-cli` needs `sudo` on macOS (there is no `operator`-group equivalent unless you add `UserName`/`GroupName` to the plist yourself).
+
+Use `bootstrap`/`bootout`, not the legacy `load`/`unload` — Apple's own `launchctl` man page deprecates `load`/`unload` in favor of `bootstrap`/`bootout`/`enable`/`disable`, and on current macOS `load` frequently fails outright for system `LaunchDaemons` with an opaque `Load failed: 5: Input/output error`. To stop and remove the daemon: `sudo launchctl bootout system/com.toaster-talk`.
 
 **Windows:**
 
@@ -75,7 +94,7 @@ Get-Service ToasterTalk
 
 `install.ps1` writes a default config and generates a master secret under `%ProgramData%\ToasterTalk` on first run.
 
-> **Changed a setting?** Edit `config.toml` and run `sudo systemctl reload toaster-talk` (Linux/macOS) or `toaster-talk-cli reload` (any platform, including Linux/macOS) — the daemon re-reads its tunable settings (message/room TTLs, timeouts, inbox cap, log level, …) in place **without dropping any agent connection**. The same reload also re-reads `rooms.yaml`, so a hand-edited room/seat expiry takes effect too. A few fields are restart-only (`bind`, `port`, `mgmt_socket`, the `store_path` *location* itself, `master_secret`) and need a full restart; a reload that changes one keeps the running value and logs a warning.
+> **Changed a setting?** Edit `config.toml` and run `sudo systemctl reload toaster-talk` (Linux) or `toaster-talk-cli reload` (any platform) — the daemon re-reads its tunable settings (message/room TTLs, timeouts, inbox cap, log level, …) in place **without dropping any agent connection**. The same reload also re-reads `rooms.yaml`, so a hand-edited room/seat expiry takes effect too. A few fields are restart-only (`bind`, `port`, `mgmt_socket`, the `store_path` *location* itself, `master_secret`) and need a full restart; a reload that changes one keeps the running value and logs a warning.
 
 ### 2. Create a room
 
@@ -204,7 +223,7 @@ The cap is per-request — agents on hosts that do not send the header are compl
 
 ### Non-systemd Unix systems
 
-If you're on Unix without systemd, run the server directly (ensure `/run/toaster-talk/` exists first, or override the socket path):
+macOS is covered by the launchd path above. If you're on some other Unix without systemd, run the server directly (ensure `/run/toaster-talk/` exists first, or override the socket path):
 
 ```bash
 sudo mkdir -p /run/toaster-talk

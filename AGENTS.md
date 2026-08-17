@@ -12,7 +12,7 @@ Read these files first:
 - `sdd/PRODUCT.md` — What this project is, why it exists, and the full vocabulary reference
 - `sdd/TDD.md` — Behavioural contract (105 rubrics across 14 functional areas). Read the table of contents first (~15 lines), then the sections relevant to your task.
 
-### If you are contributing to this project
+### If you are contributing to this project — or building, running, or testing it
 
 Read all of the above, plus:
 - `sdd/POLICY.md` — Development rules, build pipeline, logging requirements, and hard architectural constraints. You must follow these.
@@ -76,5 +76,5 @@ exceptionally long one. Concretely:
 
 ### Additional documents (read when relevant)
 
-- `sdd/ISSUES.md` — Known unresolved issues (9 open). Read when investigating unexpected behaviour or before touching transport, auth, or receive.
+- `sdd/ISSUES.md` — Known unresolved issues (9 open). Read the table of contents first, then only the entries bearing on your task; consult it when investigating unexpected behaviour or before touching transport, auth, or receive.
 - `sdd/PLAN.broadcast.md` — Deferred design for broadcast and multi-consumer rooms. Read before adding any fanout or multi-recipient capability.

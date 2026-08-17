@@ -293,7 +293,7 @@ change: *live* = takes effect on the next tool call / sweep / mgmt connection;
 | `bind` (`TOASTER_BIND`) | `string` | `"127.0.0.1"` | restart | MCP listening address (`0.0.0.0` for external). |
 | `port` (`TOASTER_PORT`) | `u16` | `6669` | restart | MCP endpoint port. |
 | `log_level` (`TOASTER_LOG_LEVEL`) | `string` | `"info"` | live | `trace\|debug\|info\|warn\|error`. `RUST_LOG`, if set, wins for the process lifetime. |
-| `mgmt_socket` (`TOASTER_MGMT_SOCKET`) | `path` | `/run/toaster-talk/mgmt.sock` (Unix); `\\.\pipe\toaster-talk` (Windows) | restart | CLI transport address. Unix: socket path (mode `0660`, dir `0750`, group `operator`). Windows: named-pipe name, DACL-restricted to the pipe's creator-owner and built-in Administrators (the equivalent gate — see `TECH.md`). |
+| `mgmt_socket` (`TOASTER_MGMT_SOCKET`) | `path` | `/run/toaster-talk/mgmt.sock` (Linux); `/usr/local/var/run/toaster-talk/mgmt.sock` (macOS); `\\.\pipe\toaster-talk` (Windows) | restart | CLI transport address. Linux uses a mode-`0660`, `operator`-group socket under `/run`; macOS uses the persistent `/usr/local` parent and the root daemon's `root:wheel` socket, so the CLI requires `sudo`. Windows uses a named pipe whose DACL is restricted to the pipe's creator-owner and built-in Administrators. |
 | `master_secret_file` (`TOASTER_MASTER_SECRET_FILE`) | `path` | — (**required**) | restart | Path (relative to config dir or absolute) to the master secret: a 40–120 char UTF-8 passphrase. Derives all room/seat tokens via HMAC-SHA256. Server refuses to start without it. |
 
 ### `[rooms]`

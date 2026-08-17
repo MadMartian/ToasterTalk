@@ -114,13 +114,22 @@ Some behaviors — the real MCP transport, client disconnect / reconnect (supers
 
 ## Deployment
 
-### Unix
+### Linux
 
 - Build first (as the user, not root): `make build`
-- Install (requires root): `sudo make install` — copies binaries to `/usr/local/bin/`, installs the systemd unit to `/etc/systemd/system/`, creates the `toaster-talk` system account if absent, and writes a default config to `/etc/toaster-talk/config.toml` if none exists.
+- Install (requires root): `sudo make install` — copies binaries to `/usr/local/bin/`, installs the systemd unit to `/etc/systemd/system/`, creates the `toaster-talk` system account if absent, writes a default config to `/etc/toaster-talk/config.toml` if none exists, and generates `/etc/toaster-talk/master.secret` if absent (mode `0600`, owned by the `toaster-talk` service account, per the master-secret rule above).
 - Systemd system service: `deploy/toaster-talk.service`. Enable with `sudo systemctl enable --now toaster-talk`.
 - Default config: `/etc/toaster-talk/config.toml`. Default token directory (operator/agent side): `~/.toaster-talk/tokens/`.
 - To update: run `make build`, then `sudo make install`, then `sudo systemctl restart toaster-talk`.
+
+### macOS
+
+- Build first (as the user, not root): `make build`
+- Install (requires root): `sudo make install` — the same target dispatches on `uname -s`, so it takes the launchd path on Darwin. Copies binaries to `/usr/local/bin/`, generates `/etc/toaster-talk/master.secret` if absent, writes a default config to `/etc/toaster-talk/config.toml` if none exists, and emits `/Library/LaunchDaemons/com.toaster-talk.plist`. Start with `sudo launchctl bootstrap system /Library/LaunchDaemons/com.toaster-talk.plist` — use `bootstrap`, not the legacy `load`: Apple's `launchctl` man page deprecates `load`/`unload` in favor of `bootstrap`/`bootout`, and `load` frequently fails outright for system `LaunchDaemons` on current macOS with an opaque `Load failed: 5: Input/output error`.
+- Default config: `/etc/toaster-talk/config.toml`. Mgmt socket: `/usr/local/var/run/toaster-talk/mgmt.sock` (see the macOS service section in TECH.md for why not `/var/run`). Default token directory (operator/agent side): `~/.toaster-talk/tokens/`.
+- The daemon runs as root, so the mgmt socket is `root:wheel` `0660` and `toaster-talk-cli` requires `sudo` — there is no `operator`-group equivalent on this platform.
+- There is no `systemctl reload` equivalent — use `sudo toaster-talk-cli reload` for a live config/room-store reload. `SIGHUP` still works if you signal the process directly.
+- To update: `make build`, `sudo make install`, then `sudo launchctl bootout system/com.toaster-talk` + `bootstrap system /Library/LaunchDaemons/com.toaster-talk.plist` the plist.
 
 ### Windows
 
@@ -133,11 +142,11 @@ Some behaviors — the real MCP transport, client disconnect / reconnect (supers
 
 ## Debug output
 
-- Logging is controlled by the `RUST_LOG` environment variable (via `tracing-subscriber`). The systemd unit sets `RUST_LOG=info` by default — sufficient for normal operation.
+- Logging is controlled by the `RUST_LOG` environment variable (via `tracing-subscriber`). Both the systemd unit and the launchd plist set `RUST_LOG=info` by default — sufficient for normal operation.
 - For troubleshooting, escalate progressively:
   - `RUST_LOG=toaster_talk=debug` — full operation detail without internal noise
   - `RUST_LOG=toaster_talk=trace` — maximum verbosity; use when debug is insufficient to pinpoint an issue
   - `RUST_LOG=trace` — includes dependency crate output (tokio, axum, rmcp); use only when the bug may be in a dependency
 - Override in the running systemd unit without a restart: `sudo systemctl set-environment RUST_LOG=toaster_talk=debug && sudo systemctl restart toaster-talk`
-- Log output goes to stdout/stderr, captured by systemd journal. View with `journalctl -u toaster-talk -f`.
+- Log output goes to stdout/stderr. On Linux systemd captures it — view with `journalctl -u toaster-talk -f`; on macOS launchd redirects it to `/var/log/toaster-talk.log` and `.err`.
 - Per the global CLAUDE.md convention, any temporary debug output added during development must be prefixed with `[🐛DEBUG]` and removed before committing.

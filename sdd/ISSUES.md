@@ -2,6 +2,18 @@
 
 This is a living register of known problems, limitations, and deferred concerns. Items are removed when resolved.
 
+| ID | Issue | Severity |
+|----|-------|----------|
+| ISS-001 | Batch receive is unbounded (DoS vector) | Medium |
+| ISS-002 | No TLS; room tokens and session tokens are transmitted in plaintext | Low / High |
+| ISS-003 | Member disconnect is not reliably detectable | Low |
+| ISS-006 | Seat token revocation requires server-side deletion | Medium |
+| ISS-007 | Master secret rotation invalidates all tokens with no migration path | Medium |
+| ISS-008 | Join/delete TOCTOU windows can register memberships against a deleted room | Negligible |
+| ISS-009 | `SessionToken` and `MemberName` remain type aliases, not newtypes | Negligible |
+| ISS-010 | Two agents sharing one seat credential cause eviction thrash | Medium |
+| ISS-011 | A send-with-reply reply can be orphaned if the recipient reconnects mid-wait | Low |
+
 ---
 
 ## ISS-001 — Batch receive is unbounded (DoS vector)

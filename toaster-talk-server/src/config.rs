@@ -206,8 +206,14 @@ fn default_store_path() -> PathBuf {
 
 /// Default management transport address: a Unix domain socket path on Unix,
 /// a named-pipe name on Windows (`mgmt.rs` interprets this value differently per
-/// platform — see `Config::mgmt_socket`).
-#[cfg(unix)]
+/// platform — see `Config::mgmt_socket`). macOS uses a persistent `/usr/local`
+/// parent because launchd has no `RuntimeDirectory=` equivalent and clears `/run`
+/// at boot.
+#[cfg(target_os = "macos")]
+fn default_mgmt_socket() -> PathBuf {
+    PathBuf::from("/usr/local/var/run/toaster-talk/mgmt.sock")
+}
+#[cfg(all(unix, not(target_os = "macos")))]
 fn default_mgmt_socket() -> PathBuf {
     PathBuf::from("/run/toaster-talk/mgmt.sock")
 }
@@ -611,6 +617,27 @@ mod tests {
         assert_eq!(config.default_message_ttl_secs, 660);
         // No default — set_test_secret supplies the mandatory value.
         assert_eq!(config.member_idle_ttl_secs, 1800);
+    }
+
+    #[test]
+    fn test_default_mgmt_socket_is_platform_native() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            default_mgmt_socket(),
+            PathBuf::from("/usr/local/var/run/toaster-talk/mgmt.sock")
+        );
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert_eq!(
+            default_mgmt_socket(),
+            PathBuf::from("/run/toaster-talk/mgmt.sock")
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            default_mgmt_socket(),
+            PathBuf::from(r"\\.\pipe\toaster-talk")
+        );
     }
 
     #[test]

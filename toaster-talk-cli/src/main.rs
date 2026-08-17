@@ -17,7 +17,8 @@ use tokio::net::UnixStream;
 #[command(name = "toaster-talk-cli", about = "ToasterTalk management CLI")]
 struct Cli {
     /// Path to the management socket on Unix, or the named pipe name on Windows
-    /// (default: /run/toaster-talk/mgmt.sock, or \\.\pipe\toaster-talk)
+    /// (default: /run/toaster-talk/mgmt.sock on Linux, /usr/local/var/run/toaster-talk/mgmt.sock
+    /// on macOS, or \\.\pipe\toaster-talk on Windows)
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
@@ -201,7 +202,13 @@ async fn main() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn default_socket() -> PathBuf {
+    // Matches RUN_DIR in the Makefile's _install-macos recipe: NOT /run, which
+    // macOS clears on every boot with no systemd RuntimeDirectory= equivalent.
+    PathBuf::from("/usr/local/var/run/toaster-talk/mgmt.sock")
+}
+#[cfg(all(unix, not(target_os = "macos")))]
 fn default_socket() -> PathBuf {
     PathBuf::from("/run/toaster-talk/mgmt.sock")
 }
@@ -222,7 +229,11 @@ fn fatal(msg: String) -> ! {
     std::process::exit(1);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn server_status_hint() -> &'static str {
+    "(sudo launchctl list | grep toaster-talk)"
+}
+#[cfg(all(unix, not(target_os = "macos")))]
 fn server_status_hint() -> &'static str {
     "(systemctl status toaster-talk)"
 }
