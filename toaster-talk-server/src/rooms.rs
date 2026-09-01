@@ -6,7 +6,7 @@ use sha2::Sha256;
 use std::{collections::HashMap, path::PathBuf};
 pub use toaster_talk_common::sanitize_filename;
 use toaster_talk_common::{ct_bytes_eq, format_duration_secs, is_valid_room_name};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -157,9 +157,23 @@ pub struct RoomStore {
 }
 
 impl RoomStore {
-    /// Load the room store from disk. Creates an empty store if the file does not exist
-    /// or is corrupt — an empty store is a safe default at startup, before any agent
-    /// has connected.
+    /// Load the room store from disk.
+    ///
+    /// A **missing** file is a safe default: this is a first run, so an empty store is
+    /// correct and the file is created on the first mutation.
+    ///
+    /// A file that **exists but cannot be read or parsed is a fatal startup error**, not
+    /// an empty store. Falling back to empty here silently destroys every room and seat:
+    /// the empty store is written back over `rooms.yaml` on the next mutation, and
+    /// because no room was ever *deleted* or *expired*, nothing is logged by those paths
+    /// — the rooms simply vanish and operators are left with orphaned token files whose
+    /// rooms no longer exist. A transient `EIO`/`EACCES`, a truncated file from a crash
+    /// mid-write, or a hand-edit typo all reach this branch, so the blast radius of the
+    /// old fallback was total and silent.
+    ///
+    /// Refusing to start is strictly safer: the data on disk is still intact, and the
+    /// operator can fix permissions or restore a backup. This mirrors `reload` below,
+    /// which has always erred rather than falling back for the same reason.
     pub fn load(store_path: PathBuf) -> Result<Self, Error> {
         let mut store = match Self::parse(&store_path) {
             Ok(Some(s)) => s,
@@ -168,12 +182,15 @@ impl RoomStore {
                 RoomStore::default()
             }
             Err(e) => {
-                warn!(
+                error!(
                     path = %store_path.display(),
                     error = %e,
-                    "room store file is corrupt or unreadable; starting with empty store"
+                    "room store file exists but is corrupt or unreadable; REFUSING to start \
+                     rather than silently discarding every persisted room and seat. The file on \
+                     disk has not been modified — fix its permissions or contents, or restore a \
+                     backup, then start the server again."
                 );
-                RoomStore::default()
+                return Err(e);
             }
         };
 
@@ -223,6 +240,16 @@ impl RoomStore {
         Ok(Some(store))
     }
 
+    /// Persist the store to disk **atomically**: serialize to a sibling temp file,
+    /// `fsync` it, then `rename` it over the real path.
+    ///
+    /// A plain `fs::write` truncates the target before writing, so a crash, kill, or
+    /// full disk mid-write leaves a truncated or empty `rooms.yaml` — which the next
+    /// startup cannot parse, silently losing every room and seat. `rename` within the
+    /// same directory is atomic on POSIX, so a reader either sees the whole previous
+    /// file or the whole new one, never a partial write. The `fsync` on the temp file
+    /// orders its contents before the rename; the directory `fsync` afterward makes the
+    /// rename itself durable across power loss.
     async fn save(&self) -> Result<(), Error> {
         let yaml = serde_yml::to_string(self)?;
         let path = self.store_path.clone();
@@ -230,13 +257,70 @@ impl RoomStore {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&path, yaml)?;
-            Ok::<_, std::io::Error>(())
+
+            // Temp file must be a sibling: `rename` is only atomic within one filesystem.
+            let tmp_path = match path.file_name() {
+                Some(name) => {
+                    let mut n = name.to_os_string();
+                    n.push(".tmp");
+                    path.with_file_name(n)
+                }
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("room store path has no file name: {}", path.display()),
+                    ))
+                }
+            };
+
+            let write_result = (|| {
+                let mut f = std::fs::File::create(&tmp_path)?;
+                std::io::Write::write_all(&mut f, yaml.as_bytes())?;
+                f.sync_all()?;
+                drop(f);
+                std::fs::rename(&tmp_path, &path)?;
+
+                // Durably record the rename itself. Not all platforms support opening a
+                // directory for fsync (Windows notably does not), so a failure here is
+                // logged and tolerated: the rename has already happened and is visible.
+                if let Some(parent) = path.parent() {
+                    match std::fs::File::open(parent) {
+                        Ok(dir) => {
+                            if let Err(e) = dir.sync_all() {
+                                debug!(
+                                    path = %parent.display(),
+                                    error = %e,
+                                    "could not fsync room store directory; rename is visible but may not survive power loss"
+                                );
+                            }
+                        }
+                        Err(e) => debug!(
+                            path = %parent.display(),
+                            error = %e,
+                            "could not open room store directory to fsync"
+                        ),
+                    }
+                }
+                Ok::<_, std::io::Error>(())
+            })();
+
+            if write_result.is_err() {
+                // Leave the previous rooms.yaml untouched; drop the partial temp file.
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            write_result
         })
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e)))?
-        .map_err(Error::Io)?;
-        debug!(path = %self.store_path.display(), "room store saved");
+        .map_err(|e| {
+            error!(
+                path = %self.store_path.display(),
+                error = %e,
+                "FAILED to persist room store; on-disk state is now stale relative to memory"
+            );
+            Error::Io(e)
+        })?;
+        debug!(path = %self.store_path.display(), "room store saved atomically");
         Ok(())
     }
 
@@ -532,12 +616,87 @@ mod tests {
     }
 
     #[test]
-    fn test_load_corrupted_file_gives_empty_store() {
+    fn test_load_corrupted_file_is_err_and_preserves_file() {
+        // A corrupt store must NOT degrade to an empty store: that fallback silently
+        // destroyed every room (the empty store was saved back over rooms.yaml on the
+        // next mutation, with no delete/expiry log line to explain it). Startup must
+        // fail instead, leaving the on-disk file byte-for-byte intact for recovery.
         let dir = TempDir::new().unwrap();
         let store_path = dir.path().join("rooms.yaml");
-        std::fs::write(&store_path, b"not: valid: yaml: {{{").unwrap();
-        let store = RoomStore::load(store_path).unwrap();
-        assert!(store.rooms.is_empty());
+        let raw = b"not: valid: yaml: {{{";
+        std::fs::write(&store_path, raw).unwrap();
+
+        assert!(
+            RoomStore::load(store_path.clone()).is_err(),
+            "a corrupt store file must be a fatal startup error, not an empty store"
+        );
+        assert_eq!(
+            std::fs::read(&store_path).unwrap(),
+            raw,
+            "load must never modify the store file it failed to parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_truncated_store_rather_than_losing_rooms() {
+        // Simulates the crash-mid-write case that the non-atomic save could produce.
+        // The truncated file must not be silently reinterpreted as "no rooms".
+        let dir = TempDir::new().unwrap();
+        let store_path = dir.path().join("rooms.yaml");
+        {
+            let mut store = RoomStore::load(store_path.clone()).unwrap();
+            store
+                .create("important".into(), 30, 50, TEST_MASTER_SECRET)
+                .await
+                .unwrap();
+        }
+
+        let raw = std::fs::read_to_string(&store_path).unwrap();
+        let truncated = &raw[..raw.len() / 2];
+        std::fs::write(&store_path, truncated).unwrap();
+
+        assert!(
+            RoomStore::load(store_path).is_err(),
+            "a truncated store must fail loudly, not present as an empty store"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_is_atomic_and_leaves_no_temp_file() {
+        // The temp file used for the atomic rename must not survive a successful save.
+        let dir = TempDir::new().unwrap();
+        let store_path = dir.path().join("rooms.yaml");
+        let mut store = RoomStore::load(store_path.clone()).unwrap();
+        store
+            .create("myroom".into(), 30, 50, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+
+        assert!(store_path.exists(), "store file must exist after save");
+        assert!(
+            !dir.path().join("rooms.yaml.tmp").exists(),
+            "temp file must be renamed away, not left behind"
+        );
+
+        // The renamed-into-place file must be complete and parseable.
+        let reloaded = RoomStore::load(store_path).unwrap();
+        assert!(reloaded.get_by_name("myroom").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_save_creates_parent_directory() {
+        // create_dir_all behaviour must survive the switch to temp-file + rename.
+        let dir = TempDir::new().unwrap();
+        let store_path = dir.path().join("nested").join("deeper").join("rooms.yaml");
+        let mut store = RoomStore::load(store_path.clone()).unwrap();
+        store
+            .create("myroom".into(), 30, 50, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+
+        assert!(store_path.exists(), "save must create missing parent dirs");
+        let reloaded = RoomStore::load(store_path).unwrap();
+        assert!(reloaded.get_by_name("myroom").is_some());
     }
 
     #[tokio::test]
