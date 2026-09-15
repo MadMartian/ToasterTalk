@@ -15,14 +15,14 @@ entirely** when absent, never rendered as `null`.
 
 ## MCP tool API (agent ↔ server)
 
-Five tools, dispatched by `ToasterServer` over both transports. Parameter structs
+Six tools, dispatched by `ToasterServer` over both transports. Parameter structs
 live in `server.rs` (`ConnectParams` / `JoinParams` / `SendParams` /
-`ReceiveParams` / `MembersParams`); responses are rendered by the formatters in
-`tools/mod.rs`. Every parameter struct denies unknown fields (TDD 9.7) — a call
-carrying a field its target tool doesn't accept (for example, `connect` called
-with `join`'s `member_name`/`room_token`) is rejected with a structured
-validation error rather than having the unrecognized field silently discarded.
-This is cross-cutting and not repeated per tool below.
+`ReceiveParams` / `MembersParams` / `LeaveParams`); responses are rendered by
+the formatters in `tools/mod.rs`. Every parameter struct denies unknown fields
+(TDD 9.7) — a call carrying a field its target tool doesn't accept (for
+example, `connect` called with `join`'s `member_name`/`room_token`) is rejected
+with a structured validation error rather than having the unrecognized field
+silently discarded. This is cross-cutting and not repeated per tool below.
 
 One `session_token` is shared across every room an agent has joined: `connect`
 mints the identity, `join` attaches each room membership to it.
@@ -79,6 +79,33 @@ Errors: `InvalidSessionToken` (missing/unrecognized `session_token`),
 `AlreadyJoinedRoom` (the caller's own session already belongs to this room —
 rejected as redundant, not a no-op), invalid/expired room or seat token,
 `RoomExpired`.
+
+### `leave`
+
+Remove the caller's own room membership — the inverse of `join`. Non-blocking.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_token` | `string` | yes | From `connect`. |
+| `room_name` | `string` | yes | The room to leave. Must be one of the rooms this session has joined; otherwise rejected with `NotConnectedToRoom`. |
+
+**Response:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `room` | `string` | The room name just left. |
+| `member_name` | `string` | The member name that was removed from the room. |
+
+Errors: `RoomNotFound` (unknown `room_name`), `NotConnectedToRoom` (the session
+has not joined `room_name`), `InvalidSessionToken`, `Superseded`.
+
+Removes only this one room membership. If this was the session's last
+remaining membership, the whole session (and its shared inbox) is torn down —
+the same last-membership teardown every other eviction path applies (see
+`TECH.md`'s concurrency model). Other room memberships under the same session
+are left completely unaffected. `leave` never touches a persisted seat
+credential in `RoomStore` — a seat holder can `join` the same room again later
+with the same seat token.
 
 ### `send`
 

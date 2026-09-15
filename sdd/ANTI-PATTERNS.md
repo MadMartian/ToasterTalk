@@ -20,6 +20,7 @@ Lessons from non-obvious bugs discovered during development. Each entry document
 | 14 | A fire-and-forget send that "helpfully" returns the sender's own inbox silently loses mail |
 | 15 | A soft "don't improvise" probe brief let a sub-agent invent a fake API shortcut instead of admitting a scenario was hard to hit |
 | 16 | A periodic sweep that walks rooms→members silently misses state that never reached a room in the first place |
+| 17 | An ad-hoc manual-test invocation that bypasses `make manual-test` loses its permission grants and its dev-up/dev-down safety net |
 
 ---
 
@@ -264,3 +265,17 @@ Lessons from non-obvious bugs discovered during development. Each entry document
 **Resolution**: Added `AppState.session_connected_at` (mirrors `session_inboxes`'s lifecycle exactly — same insert/remove sites) and a dedicated `AppState::reap_idle_roomless_sessions` step (TDD 1a.5) that walks `sessions` directly — not through `rooms` — checking each roomless entry's connect age against the same idle TTL. Also surfaced `connected_secs_ago` per session in `DUMP` (TDD 13.12), since `memberships: []` alone couldn't previously distinguish a session mid-handshake from one genuinely stuck.
 
 **Lesson**: When a sweep/reaper is implemented as "walk the parent collection, then the children," any child-shaped state that hasn't yet acquired a parent is invisible to it by construction — this is a different, easier-to-miss failure mode than #10's "we saw it but chose to skip it," because there is no line of code to point to that made the choice. After any change that lets an entity exist in an intermediate, not-yet-attached state (here: a session before its first `join`), explicitly re-check every periodic sweep for whether its traversal can reach that state at all, not just whether it correctly judges the state once reached.
+
+## 17. An ad-hoc manual-test invocation that bypasses `make manual-test` loses its permission grants and its dev-up/dev-down safety net
+
+**Symptom**: Running the MT-10 scenario by hand-constructing a `claude --mcp-config ... -p "..."` invocation (to scope the orchestrator's `BRIEF` to one scenario instead of the whole suite) failed three different ways in sequence: first a flat `Permission to use mcp__ToasterTalkDev__leave has been denied` on the newly added dev tool, then repeated denials on `make dev-up` itself once that tool was allowlisted, then — once finally invoked correctly — a `failed to bind MCP listener ... Address already in use` from an orphaned dev-server process still holding `:6668`.
+
+**What was tried**: Reconstructed the Makefile's `MANUAL_TOOLS`/`claude` command by hand so `BRIEF` could be overridden inline, copying the last known-good `--allowedTools` list and extending it piecemeal — first adding the new tool name (fixed the first denial), then discovering `make dev-up` itself needed to be in that list too (it didn't, because `make manual-test: dev-up` normally runs `dev-up` as a *prerequisite of the outer `make` invocation*, before `claude` ever starts — the sub-agent never needs Bash permission for it in the sanctioned path).
+
+**Root cause**: Two independent gaps stacked. First, hand-copying "roughly the Makefile's command" drops the free pass that `target: prereq` grants — `dev-up`/`dev-down` run in the parent `make` process, invisible to the launched session's own permission scope, only when invoked *as* `make manual-test`. Second, `dev-up`'s "already running" guard checks only `target/dev-instance/dev.pid`; when that file (or the whole `target/dev-instance` directory) is removed independently of the tracked process actually exiting — here, a stray `cargo clean`, permitted by `.claude/settings.local.json`, run by an earlier denied attempt hunting for a fix — the guard no longer sees the still-live process, and the next `dev-up` tries to bind the same port under a new PID and fails.
+
+**Resolution**: Always invoke the suite via `make manual-test BRIEF="..."` rather than reconstructing the `claude` invocation — it correctly threads `dev-up`/`dev-down` through `make`'s own prerequisite chain. When "Address already in use" does occur, `ps aux | grep toaster-talk-server` plus `ss -ltnp | grep 6668` finds the orphan; `kill <pid>` clears it before retrying.
+
+**Lesson**: A `make` target's prerequisite chain grants capabilities to whatever runs *inside* the recipe that a hand-copied version of the same command does not — reconstructing "roughly the same invocation" from a Makefile target is not equivalent to invoking the target itself; override with the target's own variable (`BRIEF=`), don't rebuild the command around it. Separately, an idempotency guard keyed on a tracking file (not the resource it tracks) desyncs the moment something touches the file without touching the resource — check the actual resource (the port, the process) when doing so is cheap.
+
+**Cost**: 4 attempts before success, including one unnecessary full `cargo build --release` from a wiped `target/` and manual `ps`/`ss`/`kill` process forensics — Severity: Medium

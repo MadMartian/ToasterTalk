@@ -21,7 +21,7 @@ Do not skip any step. If `clippy` emits a warning, fix it — do not suppress it
 
 ### Unit tests
 
-- Every tool handler (`connect`, `join`, `send` [both variants], `receive`, `members`) must have unit tests covering at least the happy path and the primary error case.
+- Every tool handler (`connect`, `join`, `leave`, `send` [both variants], `receive`, `members`) must have unit tests covering at least the happy path and the primary error case.
 - `RoomStore` persistence (load/save) must have unit tests covering round-trip serialization and handling of a missing or corrupted store file.
 - Configuration merge logic (file → env → CLI precedence) must have unit tests for each override level.
 - Run with `cargo test`.
@@ -48,7 +48,7 @@ Some behaviors — the real MCP transport, client disconnect / reconnect (supers
 - **Message body**: enforce a maximum size of 100 KB. Reject larger payloads with a descriptive error before enqueuing.
 - **TTL values**: reject message TTL above `max_ttl_secs` (config); reject room TTL above `max_ttl_days` (config). Never silently clamp — return an error so the caller knows their value was refused.
 - **Token file**: on write, set file permissions to `0600`. Room token files are written flat under `tokens/`; seat token files are written under a per-room subdirectory, `tokens/user/<room>/<member>.tok` (room → subdirectory, member → filename, both passed through `sanitize_filename`). If the derived filename already exists within its directory, append an incrementing numeric suffix (`_1`, `_2`, …) until a free slot is found (up to 999). If no free slot exists, abort with an error — do not silently overwrite.
-- **Tool parameters**: every MCP tool's parameter struct must carry `#[serde(deny_unknown_fields)]`. A call naming a field its target tool doesn't accept must be rejected with a structured validation error, never silently deserialized with the unrecognized field dropped — applies to any new tool added later, not just the current five.
+- **Tool parameters**: every MCP tool's parameter struct must carry `#[serde(deny_unknown_fields)]`. A call naming a field its target tool doesn't accept must be rejected with a structured validation error, never silently deserialized with the unrecognized field dropped — applies to any new tool added later, not just the current six.
 
 ## Code style
 

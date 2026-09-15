@@ -96,6 +96,7 @@ Both transports are registered by URL against the same server process on the sam
 |---|---|---|---|
 | `connect` | `old_session_token?` | `{session_token}` | No |
 | `join` | `session_token`, `room_token?`, `seat_token?`, `member_name` | `{room}` | No |
+| `leave` | `session_token`, `room_name` | `{room, member_name}` | No |
 | `send` | `session_token`, `room_name`, `to`, `message`, `ttl_secs?`, `await_reply_secs?` | `{message_id, ttl_secs, last_seen?, timeout?, messages[]}` | Only if `await_reply_secs` set |
 | `receive` | `session_token`, `timeout_secs?`, `room?` | `{timeout, messages[]}` | Yes |
 | `members` | `session_token`, `room_name` | `{room, member_count, members[]}` | No |
@@ -103,6 +104,7 @@ Both transports are registered by URL against the same server process on the sam
 A few architectural properties the field reference (SCHEMA.md) does not capture:
 
 - **`connect` is a pure identity mint; `join` is the only place a room membership is created.** One session token spans every room an agent belongs to, shared with one inbox (`AppState.session_inboxes`). `connect` never sees a room/seat credential or member name — there is no first-room special case. Every room, the first included, goes through `join`. `connect`'s `old_session_token` rotates the identity and tears down every room membership under it wholesale (no carryover: a bearer-only token presentation must never recover rooms — re-`join` with the room/seat credential is required); recovering a room afterward always goes through `join` again.
+- **`leave` is the inverse of `join`, built on the same eviction primitive every other departure path uses.** It resolves `room_name`, confirms the caller's session holds that membership, then calls the same `AppState::evict_member` that CLI `kckm` calls — so last-membership session teardown, in-flight blocking-call abort, and queued-message discard for the vacated room (rubric 10.16) all apply identically to a voluntary leave. It never touches a persisted seat credential in `RoomStore`: a seat holder can `join` the same room again later with the same seat token.
 - **Send-with-reply has no dedicated reply tool.** `send` with `await_reply_secs` blocks on the *sender's own* inbox — filtered to the room the `send` targeted (the mandatory counterpart of `receive`'s optional room filter) — the peer replies with a plain `send` in the opposite direction, which unblocks the waiting call. Delivered messages carry `reply_expected_within_secs` so the recipient knows a reply is awaited and how long the sender's window has left.
 - **No false delivery.** If the recipient is evicted at enqueue or mid-reply-wait, `send` returns `RecipientEvicted` rather than a `message_id` or a plain reply timeout — a sender is never told a message reached a member who is gone. The effective message TTL is extended to `await_reply_secs + ttl_secs` so the message cannot expire before the reply window closes.
 - **`receive`'s room filter is optional, `send`'s is mandatory.** Both reuse the same underlying room-filtered drain primitive (`Inbox::wait_drain_until_filtered`) threaded through the single preemptible receive slot (`park_on_inbox`) — this is *not* a new preemption model, just a predicate parameter on the existing one-inbox-one-slot machinery.
@@ -123,6 +125,7 @@ For full parameter lists, response fields, and the delivered-message object, see
 | `src/state.rs` | `AppState` — in-memory agent registrations and message queues; references `RoomStore`; `room_membership_mut` / `check_room_membership` — shared session→room lookup chain used by `join`, `send`, `receive`, and `members` |
 | `src/tools/connect.rs` | `connect` handler — mint a roomless session token, or rotate (and fully tear down) one given `old_session_token`; never touches room/seat credentials |
 | `src/tools/join.rs` | `join` handler — the only path that ever creates a room membership; room-token branch (reject on name collision) and seat-token branch (unconditionally evict-and-supersede the existing holder in that room) |
+| `src/tools/leave.rs` | `leave` handler — the inverse of `join`; resolves the caller's own membership in `room_name` and evicts it via the same `AppState::evict_member` every other eviction path uses, never touching the persisted seat credential |
 | `src/tools/send.rs` | `send` handler — resolve `room_name`, enqueue message; optionally await a room-filtered reply via own inbox |
 | `src/tools/receive.rs` | `receive` handler — await next message (optionally room-filtered) from the session's shared inbox with timeout; `park_on_inbox` is the one chokepoint every blocking wait (`receive` and send-with-reply) goes through |
 | `src/tools/roster.rs` | `members` handler — list members of the caller's own room (session-scoped) |

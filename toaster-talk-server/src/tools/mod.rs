@@ -1,5 +1,6 @@
 pub mod connect;
 pub mod join;
+pub mod leave;
 pub mod receive;
 pub mod roster;
 pub mod send;

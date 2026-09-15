@@ -10,7 +10,7 @@ This project uses Spec-Driven Development (SDD). Project documentation lives in 
 
 Read these files first:
 - `sdd/PRODUCT.md` — What this project is, why it exists, and the full vocabulary reference
-- `sdd/TDD.md` — Behavioural contract (105 rubrics across 14 functional areas). Read the table of contents first (~15 lines), then the sections relevant to your task.
+- `sdd/TDD.md` — Behavioural contract (115 rubrics across 15 functional areas). Read the table of contents first (~15 lines), then the sections relevant to your task.
 
 ### If you are contributing to this project — or building, running, or testing it
 
@@ -28,6 +28,8 @@ Read all of the above, plus:
 Every room membership — including your very first room — is created by calling `join` with that `session_token` plus a room or seat token and your member name. To join additional rooms later, call `join` again, once per room; one session, one shared inbox, spans all of them. `send` now requires `room_name` (which room to send in) and `receive`'s optional `room` field lets you drain one room specifically or, omitted, everything queued across every room you've joined in one batch.
 
 `join` never silently mints a session: a missing or invalid `session_token` is a hard error, not an implicit `connect`. `MemberNameTaken` (room-token collision with a different session) is a **fatal, non-retryable error** — do not append a suffix or invent a new name, and do not retry `join` with a different name; surface it to the operator instead. Joining a room your own session already belongs to is also rejected (not a silent no-op) — do not re-`join` a room you already hold.
+
+`leave` is the inverse of `join`: it removes only your membership in the named room, leaving your session's other room memberships (and shared inbox) completely unaffected. If it was your last remaining room, your whole session is torn down and you must `connect` + `join` fresh to use ToasterTalk again. `leave` never revokes a seat credential — you can `join` the same room again later with the same seat token.
 
 **`old_session_token` no longer carries over room state.** Only pass it to `connect` if you are deliberately rotating a still-live session token (e.g. you suspect it leaked). Doing so invalidates that session — and *every* room membership under it — immediately, with no room or message carryover whatsoever. Recovering access afterward always means calling `join` again for each room, using the room/seat token you still hold. Do not use `old_session_token` as a way to "reconnect" to a room after an ordinary disconnect — if your session token is still valid, you don't need to do anything special; if it isn't (evicted, or the server restarted), just `connect` fresh (omit `old_session_token`) and `join` each room you need.
 

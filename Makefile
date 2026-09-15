@@ -63,8 +63,7 @@ BRIEF ?= Run every scenario in toaster-talk-server/tests/MANUAL-TEST.md against 
 # target before claude launches. The quotes reach the shell literally and are
 # stripped there, so claude receives the bare `Bash(...:*)` permission strings.
 MANUAL_TOOLS := Task Read ToolSearch SendMessage \
-	mcp__ToasterTalkDev__connect mcp__ToasterTalkDev__join mcp__ToasterTalkDev__send \
-	mcp__ToasterTalkDev__receive mcp__ToasterTalkDev__members \
+	mcp__ToasterTalkDev__* \
 	'Bash(target/release/toaster-talk-cli:*)' 'Bash(yq:*)'
 manual-test: dev-up
 	claude --mcp-config deploy/dev-mcp.json --strict-mcp-config \

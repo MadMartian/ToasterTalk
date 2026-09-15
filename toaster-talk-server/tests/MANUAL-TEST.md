@@ -451,6 +451,56 @@ untouched.
 |---|---|
 | **Target** | Step 4 shows the wait still live right after the partial eviction; step 6 delivers the surviving room's message well inside the timeout, confirming the wait was never preempted. |
 
+### MT-10 — `leave` over the real MCP transport (TDD 1c)  *(VERIFIED 2026-09-14)*
+
+**Purpose:** `leave` is dispatched through `rmcp`'s tool router like any other
+tool — `cargo test`'s in-process handler calls never touch that dispatch path
+(ANTI-PATTERNS #5/#7/#9), so this confirms the new tool actually round-trips
+end-to-end, and that a self-leave gets the same partial-vs-last-membership
+teardown behavior MT-8/MT-9 already verified for `kckm`.
+
+**Setup:** reuse MT-8's two rooms (`devroom`, `devroom2`), both seated for probe_a.
+
+**Steps:**
+1. probe_a: `connect` → `session_token`, `join` `devroom`, `join` `devroom2` (same
+   session both times). **Dump-verify** one `sessions:` entry with both
+   memberships listed.
+2. probe_a calls `leave` with `room_name: devroom`. Report the exact response
+   (should echo `room: devroom` and `member_name: probe_a`).
+3. **Dump-verify:** `devroom`'s member list no longer contains probe_a;
+   `devroom2`'s member list still does; the session is NOT torn down —
+   `memberships:` now lists only `devroom2/probe_a`.
+4. probe_a calls `members` naming `room_name: devroom2` — should succeed and
+   list probe_a normally, confirming the shared inbox and surviving membership
+   are unaffected.
+5. probe_a calls `leave` again with `room_name: devroom2` (its last remaining
+   membership). Report the exact response.
+6. **Dump-verify:** probe_a's session no longer appears under `sessions:` at all
+   (full teardown — this was the last membership).
+7. probe_a calls `members` naming `room_name: devroom2` again with the *same*
+   `session_token`. Report the exact error text verbatim.
+
+**Expected outcome:**
+- Step 2: a clean success response naming the room and member that left.
+- Step 3: exactly the partial-eviction shape MT-8 verified for `kckm` — one
+  room's membership gone, the other untouched, session alive.
+- Step 6: full session teardown, since step 5 emptied the last membership.
+- Step 7: `InvalidSessionToken` (the session no longer exists) — not a hang and
+  not a stale success.
+
+**Timing caveat:** same as MT-5/MT-6 — the dev dead-seat reaper (`seat_idle_ttl_secs
+= 15`) can reap the whole session mid-scenario if steps are spread across multiple
+orchestrator↔probe round-trips. Run steps 1–7 as one uninterrupted probe turn (all
+calls back-to-back in a single tool-call sequence) rather than stepping through them
+individually — the first run of this scenario hit exactly this and produced a false
+`invalid or expired session token` failure at step 2 that had nothing to do with
+`leave` itself.
+
+| | Result |
+|---|---|
+| **Target** | `leave` behaves identically to the CLI's `kckm` for partial vs. last-membership teardown, verified over the real transport and confirmed by dump rather than assumption. |
+| **CONFIRMED 2026-09-14** | All steps passed as documented: step 2 returned `{room: "devroom", member_name: "probe_a"}`; step 4's `members devroom2` confirmed the surviving membership and session were untouched; step 5 returned `{room: "devroom2", member_name: "probe_a"}`; step 7 failed with an invalid/expired session token; the immediate CLI `dump` showed `sessions: []`, `session_map_size: 0`, and `"OK: all invariants satisfied"`. |
+
 ---
 
 ## Cleanup

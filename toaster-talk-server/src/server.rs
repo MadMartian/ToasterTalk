@@ -10,7 +10,7 @@ use crate::{
     host_cap,
     rooms::RoomStore,
     state::SharedAppState,
-    tools::{self, connect, join, receive, roster, send, Timeout},
+    tools::{self, connect, join, leave, receive, roster, send, Timeout},
 };
 use arc_swap::ArcSwap;
 use axum::http::request::Parts;
@@ -159,6 +159,16 @@ pub struct MembersParams {
     pub session_token: String,
     /// Name of the room to list members of. Must be the room your session belongs
     /// to — you can only enumerate members of a room you are connected to.
+    pub room_name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LeaveParams {
+    /// Session token returned by connect.
+    pub session_token: String,
+    /// Name of the room to leave. Must be a room your session has joined — you
+    /// can only leave a room you are connected to.
     pub room_name: String,
 }
 
@@ -354,6 +364,32 @@ impl ToasterServer {
                         }
                     }
                     CallToolResult::success(vec![Content::text(out)])
+                }
+                Err(e) => tool_error(e.to_string()),
+            };
+        Ok(result)
+    }
+
+    /// Leave a room — the inverse of `join`.
+    ///
+    /// Removes only this one room membership. If your session belongs to other
+    /// rooms, they are unaffected. If this was your session's last remaining
+    /// membership, the whole session (and its shared inbox) is torn down —
+    /// resuming any room afterward requires a fresh `connect` and `join`.
+    #[tool(
+        description = "Leave a room — the inverse of `join`. Removes only your membership in the named room_name; you must name a room your session has joined. If your session belongs to other rooms, they and your shared inbox are completely unaffected. If this was your session's only remaining room membership, the whole session (and its shared inbox) is torn down — to use ToasterTalk again afterward, call `connect` and `join` fresh. Leaving does not delete or revoke a seat credential: a seat holder can `join` the same room again later with the same seat token. Returns the room name and member name that left."
+    )]
+    pub async fn leave(&self, p: Parameters<LeaveParams>) -> Result<CallToolResult, rmcp::Error> {
+        let result =
+            match leave::handle_leave(&self.app, &self.store, p.0.session_token, p.0.room_name)
+                .await
+            {
+                Ok(r) => {
+                    let body = format!(
+                        "room: \"{}\"\nmember_name: \"{}\"\n",
+                        r.room_name, r.member_name
+                    );
+                    CallToolResult::success(vec![Content::text(body)])
                 }
                 Err(e) => tool_error(e.to_string()),
             };
@@ -629,12 +665,24 @@ mod tests {
         });
         assert!(serde_json::from_value::<MembersParams>(bad_members).is_err());
 
+        let bad_leave = serde_json::json!({
+            "session_token": "s",
+            "room_name": "r",
+            "member_name": "extra"
+        });
+        assert!(serde_json::from_value::<LeaveParams>(bad_leave).is_err());
+
         // Sanity: the legitimate shapes still deserialize fine.
         assert!(serde_json::from_value::<ConnectParams>(serde_json::json!({})).is_ok());
         assert!(serde_json::from_value::<JoinParams>(serde_json::json!({
             "session_token": "s",
             "room_token": "r",
             "member_name": "m"
+        }))
+        .is_ok());
+        assert!(serde_json::from_value::<LeaveParams>(serde_json::json!({
+            "session_token": "s",
+            "room_name": "r"
         }))
         .is_ok());
     }

@@ -4,15 +4,16 @@
 |---|---|-------------|
 | 1a | Connect | 1a.1 – 1a.5   |
 | 1b | Join | 1b.1 – 1b.7   |
+| 1c | Leave | 1c.1 – 1c.6   |
 | 2 | Send (Fire and Forget) | 2.1 – 2.6   |
-| 3 | Receive | 3.1 – 3.9   |
+| 3 | Receive | 3.1 – 3.10   |
 | 4 | Send-with-reply | 4.1 – 4.4   |
 | 5 | General Tools | 5.1 – 5.3   |
 | 6 | Message TTL | 6.1 – 6.3   |
 | 7 | Auth and isolation | 7.1 – 7.2   |
 | 8 | Configuration | 8.1 – 8.17  |
 | 9 | Error handling | 9.1 – 9.7   |
-| 10 | Room Management & Member Lifecycle | 10.1 – 10.22, 10.10b |
+| 10 | Room Management & Member Lifecycle | 10.1 – 10.22, 10.10b, 10.13b |
 | 11 | Room & Member Name Validation | 11.1, 11.1b, 11.2, 11.3 |
 | 12 | Seat Tokens | 12.1 – 12.5 |
 | 13 | Diagnostics | 13.1 – 13.12 |
@@ -94,6 +95,38 @@
 - **Given** the agent has joined a room and has a valid session token
 - **When** the agent attempts to join that same room again, with a valid session token
 - **Then** the MCP server returns an error message indicating that the agent has already joined that room
+
+---
+
+## 1c. Leave
+
+### 1c.1
+- **Given** an agent's session has joined a room
+- **When** it calls `leave` naming that room
+- **Then** the room membership is removed and the server confirms which room and member name were removed
+
+### 1c.2
+- **Given** an agent's session belongs to more than one room
+- **When** it calls `leave` for one of them
+- **Then** only that one room membership is removed — the session, its shared inbox, and its other room memberships are completely unaffected (mirrors 10.21)
+
+### 1c.3
+- **Given** an agent's session holds exactly one room membership
+- **When** it calls `leave` for that room
+- **Then** the room membership is removed and, since it was the session's last remaining membership, the whole session and its shared inbox are torn down — resuming any room afterward requires a fresh `connect` and `join`, exactly like any other last-membership eviction
+
+### 1c.4
+- **Given** an agent's session has not joined the named room
+- **When** it calls `leave` for that room
+- **Then** the server rejects the call with an error indicating the agent is not connected to that room, rather than treating it as a no-op
+
+### 1c.5
+- **Given** an agent calls `leave` naming a room that does not exist
+- **Then** the server rejects the call with an error indicating the room was not found
+
+### 1c.6
+- **Given** an agent calls `leave` with a missing or invalid session token
+- **Then** the server rejects the call with an error indicating the session token is invalid
 
 ---
 
@@ -450,7 +483,7 @@ This section implies rubrics from section 3 (Receive) and rubrics 2.4-2.6 from s
 
 ### 10.10
 - **Given** a member is connected to a room and currently blocked in a long-timeout `receive` **or** a send-with-reply reply-wait, and this eviction empties the last (or only) room membership the session holds
-- **When** that member is evicted by any path — operator CLI (`kckm`, `kckall`, room deletion `delrm`), idle TTL, room expiry, or a seat-holder supersede
+- **When** that member is evicted by any path — operator CLI (`kckm`, `kckall`, room deletion `delrm`), idle TTL, room expiry, a seat-holder supersede, or a voluntary `leave`
 - **Then** the member's in-flight blocking call is aborted and returns promptly — it does **not** stay parked until its `timeout_secs` elapses
 
 ### 10.10b
