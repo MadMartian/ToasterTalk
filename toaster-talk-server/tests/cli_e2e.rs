@@ -12,6 +12,7 @@
 //!   test_kckm_removes_member               → TDD 10.8
 //!   test_kckm_removes_multiple_members     → TDD 10.8
 //!   test_kckall_removes_all_members        → TDD 10.9
+//!   test_addrm_addmb_batch_*, test_delrm_delmb_kckall_batch_* → TDD 10.23–10.25
 
 mod common;
 
@@ -422,4 +423,145 @@ async fn test_kckall_removes_all_members() {
         store.read().await.verify_token(&room_token).is_some(),
         "room token must remain valid after kckall"
     );
+}
+
+// ── Batch management commands (TDD 10.23–10.25) ───────────────────────────────
+
+async fn run_cli(socket: &Path, token_dir: &Path, args: &[&str]) -> std::process::Output {
+    tokio::process::Command::new(cli_bin())
+        .args(["--socket", socket.to_str().unwrap()])
+        .args(["--token-dir", token_dir.to_str().unwrap()])
+        .args(args)
+        .output()
+        .await
+        .expect("failed to spawn toaster-talk-cli — run `cargo build --workspace` first")
+}
+
+/// Rubric 10.23/10.24: addrm / addmb take several names in one command, create
+/// each, and write one token file per item; repeating the identical command does
+/// not write any additional (`_1`) file.
+#[tokio::test]
+async fn test_addrm_addmb_batch_create_and_reuse_identical_token_files() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir);
+    let app = AppState::new();
+    let socket_path = common::test_mgmt_addr(&dir);
+    let token_dir = dir.path().join("tokens");
+    spawn_mgmt(&socket_path, &store, &app).await;
+
+    let out = run_cli(&socket_path, &token_dir, &["addrm", "r-one", "r-two"]).await;
+    assert!(out.status.success(), "addrm batch must exit 0");
+    assert!(store.read().await.get_by_name("r-one").is_some());
+    assert!(store.read().await.get_by_name("r-two").is_some());
+    assert!(token_dir.join("r-one.tok").exists());
+    assert!(token_dir.join("r-two.tok").exists());
+
+    let out = run_cli(
+        &socket_path,
+        &token_dir,
+        &["addmb", "r-one", "alice", "bob"],
+    )
+    .await;
+    assert!(out.status.success(), "addmb batch must exit 0");
+    let seats = token_dir.join("user").join("r-one");
+    assert!(seats.join("alice.tok").exists());
+    assert!(seats.join("bob.tok").exists());
+
+    // Same seats again: the server regenerates identical deterministic tokens and
+    // the CLI must recognise the identical files rather than add `_1` copies.
+    let out = run_cli(
+        &socket_path,
+        &token_dir,
+        &["addmb", "r-one", "alice", "bob"],
+    )
+    .await;
+    assert!(out.status.success());
+    assert!(
+        !seats.join("alice_1.tok").exists() && !seats.join("bob_1.tok").exists(),
+        "identical seat files must be reused, not duplicated"
+    );
+
+    // Re-adding existing rooms re-derives the same deterministic token, so the
+    // identical room token files must be reused too.
+    let out = run_cli(&socket_path, &token_dir, &["addrm", "r-one", "r-two"]).await;
+    assert!(out.status.success());
+    assert!(!token_dir.join("r-one_1.tok").exists());
+    assert!(!token_dir.join("r-two_1.tok").exists());
+}
+
+/// Rubric 10.25: a partly failing batch applies the items that can succeed,
+/// reports the rest, and exits non-zero.
+#[tokio::test]
+async fn test_delrm_delmb_kckall_batch_partial_failure() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir);
+    let app = AppState::new();
+    let socket_path = common::test_mgmt_addr(&dir);
+    let token_dir = dir.path().join("tokens");
+    create_room(&store, "b-one").await;
+    create_room(&store, "b-two").await;
+    spawn_mgmt(&socket_path, &store, &app).await;
+
+    run_cli(
+        &socket_path,
+        &token_dir,
+        &["addmb", "b-one", "alice", "bob"],
+    )
+    .await;
+
+    let out = run_cli(
+        &socket_path,
+        &token_dir,
+        &["delmb", "b-one", "alice", "ghost", "bob"],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "a failed item must make delmb exit non-zero"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ghost"));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("alice")
+            && String::from_utf8_lossy(&out.stdout).contains("bob"),
+        "the items that could be deleted must still be reported"
+    );
+
+    let out = run_cli(&socket_path, &token_dir, &["kckall", "b-one", "b-two"]).await;
+    assert!(
+        out.status.success(),
+        "kckall over existing rooms must exit 0"
+    );
+
+    let out = run_cli(
+        &socket_path,
+        &token_dir,
+        &["delrm", "b-one", "nope", "b-two"],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "unknown room must make delrm exit non-zero"
+    );
+    assert!(store.read().await.get_by_name("b-one").is_none());
+    assert!(store.read().await.get_by_name("b-two").is_none());
+}
+
+/// `--file` names one file and is refused when several items are given.
+#[tokio::test]
+async fn test_file_flag_rejected_for_multiple_names() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir);
+    let app = AppState::new();
+    let socket_path = common::test_mgmt_addr(&dir);
+    let token_dir = dir.path().join("tokens");
+    spawn_mgmt(&socket_path, &store, &app).await;
+
+    let out = run_cli(
+        &socket_path,
+        &token_dir,
+        &["addrm", "x", "y", "--file", "z"],
+    )
+    .await;
+    assert!(!out.status.success());
+    assert!(store.read().await.get_by_name("x").is_none());
 }

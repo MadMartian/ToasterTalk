@@ -112,9 +112,12 @@ whatever session currently holds that seat's room/member, so an agent recovers b
 simply connecting and joining again:
 
 ```bash
-toaster-talk-cli addmb "qa-review" "dev"
-# Seat token file written to ~/.toaster-talk/tokens/user/qa-review/dev.tok
+toaster-talk-cli addmb "qa-review" "dev" "qa"
+# Seat token files written to ~/.toaster-talk/tokens/user/qa-review/{dev,qa}.tok
 ```
+
+`addrm`, `delrm`, `kckall`, `addmb`, `delmb` and `kckm` all accept several names in one
+command. Re-running one writes no duplicate token files when the contents are identical.
 
 ### 3. Configure your AI client
 

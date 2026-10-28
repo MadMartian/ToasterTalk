@@ -13,6 +13,7 @@ This is a living register of known problems, limitations, and deferred concerns.
 | ISS-009 | `SessionToken` and `MemberName` remain type aliases, not newtypes | Negligible |
 | ISS-010 | Two agents sharing one seat credential cause eviction thrash | Medium |
 | ISS-011 | A send-with-reply reply can be orphaned if the recipient reconnects mid-wait | Low |
+| ISS-012 | `addrm` on an existing room name silently replaces the room, dropping its seats | Medium |
 
 ---
 
@@ -159,3 +160,18 @@ This is the trade-off of the transfer-queue reconnect design: the *request* surv
 - Accept it — the sender gets a clear `RecipientEvicted` and can retry; the window (a reconnect landing exactly during a send-with-reply to that member) is narrow.
 - Adopt a "reuse the old inbox" reconnect design instead of transfer-queue: keep the same `Arc<Inbox>` across reconnect (abort the old receiver, swap the session token, do not close it), so the waiting sender is never evicted and receives the real reply. Larger change; needs care around the generation counter and the close / `RecipientEvicted` contract.
 
+---
+
+## ISS-012 — `addrm` on an existing room name silently replaces the room, dropping its seats
+
+**Area**: Room management
+**Severity**: Medium
+**Status**: Open
+
+`RoomStore::create` does not check for an existing room of the same name. The room token is a deterministic HMAC of the name, so a second `addrm` for a live room derives the same token and the new `Room` replaces the old one in the store: its `seats` map is emptied and its created/expiry timestamps are reset. The CLI reports success and, with batch `addrm`, one repeated name in a long list does this without any indication. Members already connected under the room token keep their sessions; seat holders lose their credentials' registration (the `.tok` files remain on disk but stop authenticating until `addmb` is re-run).
+
+Found by reading the code while adding batch commands; not reproduced against a running server.
+
+**Mitigation options:**
+- Reject `addrm` with an error when a room of that name already exists (idempotent re-run then requires `gtrm`/`lsrm` first).
+- Make it idempotent: return the existing room's token and expiry unchanged, so re-running `addrm` is a no-op that still lets the CLI re-check its token file.

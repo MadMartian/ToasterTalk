@@ -229,17 +229,29 @@ double-quoted for structural clarity.
 
 | Command | Request | Success response |
 |---------|---------|------------------|
-| `ADDRM` | `ADDRM <name> [TTL <days>]` | `+ROOM_CREATED "<name>" <token> <expires_unix>` |
-| `DELRM` | `DELRM <name>` | `+ROOM_DELETED "<name>" evicted:<count>` |
+| `ADDRM` | `ADDRM "<name>" ["<name>" ...] [TTL <days>]` | `+ROOM_CREATED "<name>" <token> <expires_unix>` |
+| `DELRM` | `DELRM "<name>" ["<name>" ...]` | `+ROOM_DELETED "<name>" evicted:<count>` |
 | `LSRM` | `LSRM` | `*<n>` then `<name> created:<ts> expires:<ts> members:<n>` per room |
 | `GTRM` | `GTRM "<name>"` | `+ROOM "<name>" created:<ts> expires:<ts> members:<n>` then one member name per line |
 | `KCKM` | `KCKM "<room>" "<member>" ["<member>" ...]` | `+KICKED "<room>" kicked:<member> [...] [notfound:<member> ...]` |
-| `KCKALL` | `KCKALL "<room>"` | `+KICKED_ALL "<room>" evicted:<count>` |
-| `ADDMB` | `ADDMB "<room>" "<member>" [TTL <days>]` | `+SEAT_CREATED "<room>" "<member>" <seat_token> <expires_unix>` |
-| `DELMB` | `DELMB "<room>" "<member>"` | `+SEAT_DELETED "<room>" "<member>"` |
+| `KCKALL` | `KCKALL "<room>" ["<room>" ...]` | `+KICKED_ALL "<room>" evicted:<count>` |
+| `ADDMB` | `ADDMB "<room>" "<member>" ["<member>" ...] [TTL <days>]` | `+SEAT_CREATED "<room>" "<member>" <seat_token> <expires_unix>` |
+| `DELMB` | `DELMB "<room>" "<member>" ["<member>" ...]` | `+SEAT_DELETED "<room>" "<member>"` |
 | `LSMB` | `LSMB "<room>"` | `*<n>` then `"<member>" created:<ts> expires:<ts>` per seat |
 | `RELOAD` | `RELOAD` | `+RELOADED` once the reload has actually been applied (TDD 8.17) |
 | `DUMP` | `DUMP` | `+DUMP` then a redacted YAML body — the live in-memory snapshot (see `TECH.md` and TDD §13) |
+
+**Batch commands.** `ADDRM`, `DELRM`, `KCKALL`, `ADDMB` and `DELMB` accept several
+names in one request (`KCKM` already does). The response is one line per distinct
+name, in request order, each either that command's usual `+...` success line (the
+table above) or `-<message>`; with more than one name a failure line reads
+`-<name>: <message>`, so a single-name response is identical to the pre-batch form.
+Items are independent — there is no all-or-nothing rollback — and the CLI exits
+non-zero if any line is a `-`. A trailing `TTL <days>` applies to every name and is
+recognised only after at least one name (so a lone item called `ttl` is a name; a
+batch whose *last* name is `ttl` is read as a TTL with no value and refused). An
+over-cap `TTL` refuses the whole `ADDRM` before anything is created. For `DELMB`
+an unknown room fails the whole command; for `KCKALL`/`DELRM` it fails that item.
 
 `RELOAD` triggers the same config + room-store reload as Unix's `SIGHUP` (see
 `[messages]`/`[rooms]` Reload column below) through this connection instead of an
@@ -295,7 +307,8 @@ already-restricted directory) to preserve the `0600`-equivalent guarantee.
 
 **Filename derivation** (`sanitize_filename`): the room name (room files) or member
 name (seat files) is lowercased, non-alphanumerics stripped except spaces → `_`. On
-collision within a directory an incrementing suffix (`_1`, `_2`, …) is appended. Seat
+collision within a directory, a file already holding identical contents is reused; otherwise
+an incrementing suffix (`_1`, `_2`, …) is appended. Seat
 files are grouped one subdirectory per room, so seats are self-describing on disk.
 
 ---

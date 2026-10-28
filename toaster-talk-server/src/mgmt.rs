@@ -341,19 +341,17 @@ async fn dispatch(
 // ── ADDRM ─────────────────────────────────────────────────────────────────────
 
 async fn cmd_addrm(args: &[String], store: &Arc<RwLock<RoomStore>>, config: &MgmtConfig) -> String {
-    if args.is_empty() {
-        return err_response("ADDRM requires a room name");
-    }
-
-    let name = args[0].clone();
-
-    // Parse optional keyword arg: TTL <days>
-    let ttl_days = match parse_ttl_arg(args, 1) {
-        Ok(Some(v)) => v,
-        Ok(None) => config.default_room_ttl_days,
+    let (names, ttl) = match split_trailing_ttl(args) {
+        Ok(v) => v,
         Err(e) => return err_response(&e),
     };
+    if names.is_empty() {
+        return err_response("ADDRM requires at least one room name");
+    }
 
+    let ttl_days = ttl.unwrap_or(config.default_room_ttl_days);
+    // A TTL over the cap is a property of the whole command, not of one name:
+    // refuse the batch before creating anything.
     if ttl_days > config.max_room_ttl_days {
         return err_response(
             &Error::RoomTtlExceeded {
@@ -364,11 +362,26 @@ async fn cmd_addrm(args: &[String], store: &Arc<RwLock<RoomStore>>, config: &Mgm
         );
     }
 
+    let mut results = Vec::new();
+    for name in unique_names(names) {
+        let result = add_one_room(name, ttl_days, store, config).await;
+        results.push((name.clone(), result));
+    }
+    render_batch(results)
+}
+
+/// Create one room. `Ok` is the `+ROOM_CREATED ...` line, `Err` the bare message.
+async fn add_one_room(
+    name: &str,
+    ttl_days: u64,
+    store: &Arc<RwLock<RoomStore>>,
+    config: &MgmtConfig,
+) -> Result<String, String> {
     let result = {
         let mut store_write = store.write().await;
         store_write
             .create(
-                name.clone(),
+                name.to_string(),
                 ttl_days,
                 config.max_rooms,
                 config.master_secret.as_bytes(),
@@ -381,14 +394,14 @@ async fn cmd_addrm(args: &[String], store: &Arc<RwLock<RoomStore>>, config: &Mgm
             info!(room = %name, "room created via CLI");
             // Send the token back so the CLI can write the token file on its host.
             // Name is double-quoted so space-containing names parse correctly (F-006).
-            format!(
+            Ok(format!(
                 "+ROOM_CREATED \"{}\" {} {}",
                 room.name, room.token, room.expires_at_secs
-            )
+            ))
         }
         Err(e) => {
             warn!(room = %name, error = %e, "ADDRM failed");
-            err_response(&e.to_string())
+            Err(e.to_string())
         }
     }
 }
@@ -401,10 +414,23 @@ async fn cmd_delrm(
     app: &SharedAppState,
 ) -> String {
     if args.is_empty() {
-        return err_response("DELRM requires a room name");
+        return err_response("DELRM requires at least one room name");
     }
-    let name = &args[0];
 
+    let mut results = Vec::new();
+    for name in unique_names(args) {
+        let result = del_one_room(name, store, app).await;
+        results.push((name.clone(), result));
+    }
+    render_batch(results)
+}
+
+/// Delete one room. `Ok` is the `+ROOM_DELETED ...` line, `Err` the bare message.
+async fn del_one_room(
+    name: &str,
+    store: &Arc<RwLock<RoomStore>>,
+    app: &SharedAppState,
+) -> Result<String, String> {
     // Find token before locking store for delete (to evict from AppState).
     // `.ok()` because a missing room is reported by store.delete() below, not here.
     let token = resolve_room_token(store, name).await.ok();
@@ -417,7 +443,7 @@ async fn cmd_delrm(
     match result {
         Err(e) => {
             warn!(room = %name, error = %e, "DELRM failed");
-            err_response(&e.to_string())
+            Err(e.to_string())
         }
         Ok(room) => {
             let members_evicted = if let Some(tok) = token {
@@ -428,10 +454,10 @@ async fn cmd_delrm(
             };
 
             info!(room = %name, members_evicted, "room deleted via CLI");
-            format!(
+            Ok(format!(
                 "+ROOM_DELETED \"{}\" evicted:{}",
                 room.name, members_evicted
-            )
+            ))
         }
     }
 }
@@ -567,21 +593,33 @@ async fn cmd_kckall(
     app: &SharedAppState,
 ) -> String {
     if args.is_empty() {
-        return err_response("KCKALL requires a room name");
+        return err_response("KCKALL requires at least one room name");
     }
-    let room_name = &args[0];
 
-    let token = match resolve_room_token(store, room_name).await {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
+    let mut results = Vec::new();
+    for room_name in unique_names(args) {
+        let result = kick_all_in_room(room_name, store, app).await;
+        results.push((room_name.clone(), result));
+    }
+    render_batch(results)
+}
+
+/// Evict every member of one room. `Ok` is the `+KICKED_ALL ...` line.
+async fn kick_all_in_room(
+    room_name: &str,
+    store: &Arc<RwLock<RoomStore>>,
+    app: &SharedAppState,
+) -> Result<String, String> {
+    let token = resolve_room_token(store, room_name)
+        .await
+        .map_err(|e| e.trim_start_matches('-').to_string())?;
 
     let mut app_write = app.write().await;
     let count = app_write
         .evict_all_members(&token, room_name, "all members kicked by operator")
         .await;
     info!(room = %room_name, members_kicked = count, "all members kicked via CLI");
-    format!("+KICKED_ALL \"{}\" evicted:{}", room_name, count)
+    Ok(format!("+KICKED_ALL \"{}\" evicted:{}", room_name, count))
 }
 
 // ── ADDMB ─────────────────────────────────────────────────────────────────────
@@ -592,35 +630,52 @@ async fn cmd_addmb(
     master_secret: &[u8],
 ) -> String {
     if args.len() < 2 {
-        return err_response("ADDMB requires a room name and member name");
+        return err_response("ADDMB requires a room name and at least one member name");
     }
-    let room_name = args[0].clone();
-    let member_name = args[1].clone();
-
-    let ttl_days = match parse_ttl_arg(args, 2) {
-        Ok(Some(v)) => v,
-        Ok(None) => 0, // 0 = inherit the room's remaining lifetime
+    let room_name = &args[0];
+    let (members, ttl) = match split_trailing_ttl(&args[1..]) {
+        Ok(v) => v,
         Err(e) => return err_response(&e),
     };
+    if members.is_empty() {
+        return err_response("ADDMB requires a room name and at least one member name");
+    }
+    let ttl_days = ttl.unwrap_or(0); // 0 = inherit the room's remaining lifetime
 
+    let mut results = Vec::new();
+    for member_name in unique_names(members) {
+        let result = add_one_seat(room_name, member_name, ttl_days, store, master_secret).await;
+        results.push((member_name.clone(), result));
+    }
+    render_batch(results)
+}
+
+/// Create one seat. `Ok` is the `+SEAT_CREATED ...` line, `Err` the bare message.
+async fn add_one_seat(
+    room_name: &str,
+    member_name: &str,
+    ttl_days: u64,
+    store: &Arc<RwLock<RoomStore>>,
+    master_secret: &[u8],
+) -> Result<String, String> {
     let result = {
         let mut store_write = store.write().await;
         store_write
-            .create_seat(&room_name, &member_name, ttl_days, master_secret)
+            .create_seat(room_name, member_name, ttl_days, master_secret)
             .await
     };
 
     match result {
         Ok((seat_token, expires_at_secs)) => {
             info!(room = %room_name, member = %member_name, "seat token created via CLI");
-            format!(
+            Ok(format!(
                 "+SEAT_CREATED \"{}\" \"{}\" {} {}",
                 room_name, member_name, seat_token, expires_at_secs
-            )
+            ))
         }
         Err(e) => {
             warn!(room = %room_name, member = %member_name, error = %e, "ADDMB failed");
-            err_response(&e.to_string())
+            Err(e.to_string())
         }
     }
 }
@@ -633,16 +688,33 @@ async fn cmd_delmb(
     app: &SharedAppState,
 ) -> String {
     if args.len() < 2 {
-        return err_response("DELMB requires a room name and member name");
+        return err_response("DELMB requires a room name and at least one member name");
     }
     let room_name = &args[0];
-    let member_name = &args[1];
 
+    // The room is shared by every member in the batch: an unknown room fails the
+    // whole command up front rather than once per member.
     let room_token = match resolve_room_token(store, room_name).await {
         Ok(t) => t,
         Err(e) => return e,
     };
 
+    let mut results = Vec::new();
+    for member_name in unique_names(&args[1..]) {
+        let result = del_one_seat(room_name, member_name, &room_token, store, app).await;
+        results.push((member_name.clone(), result));
+    }
+    render_batch(results)
+}
+
+/// Delete one seat and evict its live session. `Ok` is the `+SEAT_DELETED ...` line.
+async fn del_one_seat(
+    room_name: &str,
+    member_name: &str,
+    room_token: &RoomToken,
+    store: &Arc<RwLock<RoomStore>>,
+    app: &SharedAppState,
+) -> Result<String, String> {
     let result = {
         let mut store_write = store.write().await;
         store_write.delete_seat(room_name, member_name).await
@@ -651,15 +723,18 @@ async fn cmd_delmb(
     match result {
         Err(e) => {
             warn!(room = %room_name, member = %member_name, error = %e, "DELMB failed");
-            err_response(&e.to_string())
+            Err(e.to_string())
         }
         Ok(()) => {
             let mut app_write = app.write().await;
             app_write
-                .evict_member_superseded(&room_token, room_name, member_name)
+                .evict_member_superseded(room_token, room_name, member_name)
                 .await;
             info!(room = %room_name, member = %member_name, "seat token deleted via CLI");
-            format!("+SEAT_DELETED \"{}\" \"{}\"", room_name, member_name)
+            Ok(format!(
+                "+SEAT_DELETED \"{}\" \"{}\"",
+                room_name, member_name
+            ))
         }
     }
 }
@@ -896,29 +971,51 @@ fn err_response(msg: &str) -> String {
     format!("-{msg}")
 }
 
-/// Parse an optional `TTL <days>` keyword argument starting at `args[start]`.
-/// Returns `Ok(None)` when no TTL keyword is present, `Ok(Some(days))` when one
-/// is, and `Err(message)` for malformed input. Shared by ADDRM and ADDMB (M-R4-C04).
-fn parse_ttl_arg(args: &[String], start: usize) -> Result<Option<u64>, String> {
-    let mut ttl_days: Option<u64> = None;
-    let mut i = start;
-    while i < args.len() {
-        match args[i].to_ascii_uppercase().as_str() {
-            "TTL" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("TTL requires a value".to_string());
-                }
-                match args[i].parse::<u64>() {
-                    Ok(v) => ttl_days = Some(v),
-                    Err(_) => return Err("TTL value must be a positive integer".to_string()),
-                }
-            }
-            other => return Err(format!("unexpected argument: {other}")),
-        }
-        i += 1;
+/// Split a batch command's arguments into its item names and an optional
+/// trailing `TTL <days>` pair that applies to every name. The pair is only
+/// recognised after at least one name, so a lone item literally called `ttl`
+/// is still a name. Shared by ADDRM and ADDMB.
+fn split_trailing_ttl(args: &[String]) -> Result<(&[String], Option<u64>), String> {
+    let n = args.len();
+    if n >= 3 && args[n - 2].eq_ignore_ascii_case("TTL") {
+        return match args[n - 1].parse::<u64>() {
+            Ok(v) => Ok((&args[..n - 2], Some(v))),
+            Err(_) => Err("TTL value must be a positive integer".to_string()),
+        };
     }
-    Ok(ttl_days)
+    if n >= 2 && args[n - 1].eq_ignore_ascii_case("TTL") {
+        return Err("TTL requires a value".to_string());
+    }
+    Ok((args, None))
+}
+
+/// Names in first-occurrence order, ignoring repeats — a name repeated on one
+/// command line is accounted for once, as KCKM does.
+fn unique_names(names: &[String]) -> Vec<&String> {
+    let mut out: Vec<&String> = Vec::new();
+    for name in names {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Join per-item batch results into one response, a line per item in request
+/// order: the item's `+...` success line, or `-<message>` for a failure. A
+/// failure line is labelled with the item name only when the batch holds more
+/// than one item, so a single-item response is exactly the pre-batch form.
+fn render_batch(results: Vec<(String, Result<String, String>)>) -> String {
+    let batch = results.len() > 1;
+    results
+        .into_iter()
+        .map(|(label, result)| match result {
+            Ok(line) => line,
+            Err(msg) if batch => err_response(&format!("{label}: {msg}")),
+            Err(msg) => err_response(&msg),
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
 }
 
 /// Resolve a room name to its token, or an `err_response` string if not found.

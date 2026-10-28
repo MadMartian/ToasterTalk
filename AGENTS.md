@@ -10,7 +10,7 @@ This project uses Spec-Driven Development (SDD). Project documentation lives in 
 
 Read these files first:
 - `sdd/PRODUCT.md` — What this project is, why it exists, and the full vocabulary reference
-- `sdd/TDD.md` — Behavioural contract (115 rubrics across 15 functional areas). Read the table of contents first (~15 lines), then the sections relevant to your task.
+- `sdd/TDD.md` — Behavioural contract (118 rubrics across 15 functional areas). Read the table of contents first (~15 lines), then the sections relevant to your task.
 
 ### If you are contributing to this project — or building, running, or testing it
 
@@ -37,5 +37,5 @@ Because `session_token` now grants access to every room your session belongs to 
 
 ### Additional documents (read when relevant)
 
-- `sdd/ISSUES.md` — Known unresolved issues (9 open). Read the table of contents first, then only the entries bearing on your task; consult it when investigating unexpected behaviour or before touching transport, auth, or receive.
+- `sdd/ISSUES.md` — Known unresolved issues (10 open). Read the table of contents first, then only the entries bearing on your task; consult it when investigating unexpected behaviour or before touching transport, auth, or receive.
 - `sdd/PLAN.broadcast.md` — Deferred design for broadcast and multi-consumer rooms. Read before adding any fanout or multi-recipient capability.

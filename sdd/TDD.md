@@ -13,7 +13,7 @@
 | 7 | Auth and isolation | 7.1 – 7.2   |
 | 8 | Configuration | 8.1 – 8.17  |
 | 9 | Error handling | 9.1 – 9.7   |
-| 10 | Room Management & Member Lifecycle | 10.1 – 10.22, 10.10b, 10.13b |
+| 10 | Room Management & Member Lifecycle | 10.1 – 10.25, 10.10b, 10.13b |
 | 11 | Room & Member Name Validation | 11.1, 11.1b, 11.2, 11.3 |
 | 12 | Seat Tokens | 12.1 – 12.5 |
 | 13 | Diagnostics | 13.1 – 13.12 |
@@ -560,6 +560,21 @@ This section implies rubrics from section 3 (Receive) and rubrics 2.4-2.6 from s
 - **Given** an agent is evicted from a room
 - **When** the agent makes any request involving that room (other than join)
 - **Then** their request is rejected indicating that they are not a member of that room
+
+### 10.23
+- **Given** a human operator is using the CLI to manage the server
+- **When** they create, delete, or kick-all across several rooms (`addrm`, `delrm`, `kckall`), or add or delete several members of one room (`addmb`, `delmb`), in a single command
+- **Then** each distinct name is processed independently, in the order given, and the CLI reports the outcome of every item; a name repeated on the command line is processed once
+
+### 10.24
+- **Given** the CLI is about to write a room or seat token file
+- **When** a file at the target name — or at one of its numeric-suffix variants — already holds exactly the contents about to be written
+- **Then** that file is reused and no additional file is created; a differing file at the name still gets the next free numeric suffix, never an overwrite
+
+### 10.25
+- **Given** a batch command in which some items can be applied and others cannot (unknown room, unknown member, invalid name)
+- **When** the command runs
+- **Then** the items that can succeed are applied, each failed item is reported with its name, and the CLI exits non-zero because at least one item failed
 
 ## 11. Room & Member Name Validation
 

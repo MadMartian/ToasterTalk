@@ -32,21 +32,24 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create a new room and write a token file locally
+    /// Create one or more rooms and write a token file locally for each
     Addrm {
-        /// Human-readable room name (e.g. "qa-review")
-        name: String,
-        /// Room TTL in days (default: server default)
+        /// Human-readable room name(s) (e.g. "qa-review") — one or more
+        #[arg(required = true, num_args = 1..)]
+        names: Vec<String>,
+        /// Room TTL in days, applied to every room (default: server default)
         #[arg(long)]
         ttl: Option<u64>,
-        /// Token filename without extension (default: derived from name)
+        /// Token filename without extension (default: derived from name);
+        /// only valid when creating a single room
         #[arg(long)]
         file: Option<String>,
     },
-    /// Delete a room and remove its local token file
+    /// Delete one or more rooms
     Delrm {
-        /// Room name to delete
-        name: String,
+        /// Room name(s) to delete — one or more
+        #[arg(required = true, num_args = 1..)]
+        names: Vec<String>,
     },
     /// List all active rooms
     Lsrm,
@@ -63,33 +66,36 @@ enum Command {
         #[arg(required = true, num_args = 1..)]
         members: Vec<String>,
     },
-    /// Kick all members from a room (does not delete the room)
+    /// Kick all members from one or more rooms (does not delete the rooms)
     Kckall {
-        /// Room name
-        name: String,
+        /// Room name(s) — one or more
+        #[arg(required = true, num_args = 1..)]
+        names: Vec<String>,
     },
-    /// Create a seat token (member credential) for a room
+    /// Create seat tokens (member credentials) for one or more members of a room
     #[command(name = "addmb")]
     AddMember {
-        /// Room name the seat belongs to
+        /// Room name the seats belong to
         name: String,
-        /// Member name to authorise (1–40 chars, [a-zA-Z0-9_-])
-        member: String,
-        /// Seat TTL in days; 0 or omit to inherit room lifetime
+        /// Member name(s) to authorise (1–40 chars, [a-zA-Z0-9_-]) — one or more
+        #[arg(required = true, num_args = 1..)]
+        members: Vec<String>,
+        /// Seat TTL in days, applied to every member; 0 or omit to inherit room lifetime
         #[arg(long)]
         ttl: Option<u64>,
         /// Token filename hint without extension, written under tokens/user/<room>/
-        /// (default: the member name)
+        /// (default: the member name); only valid when adding a single member
         #[arg(long)]
         file: Option<String>,
     },
-    /// Delete a seat token (evicts the member if connected)
+    /// Delete seat tokens (evicts each member if connected)
     #[command(name = "delmb")]
     DeleteMember {
         /// Room name
         name: String,
-        /// Member name whose seat to delete
-        member: String,
+        /// Member name(s) whose seat to delete — one or more
+        #[arg(required = true, num_args = 1..)]
+        members: Vec<String>,
     },
     /// List all seat tokens for a room
     #[command(name = "lsmb")]
@@ -115,18 +121,19 @@ async fn main() {
     let token_dir = cli.token_dir.unwrap_or_else(default_token_dir);
 
     match &cli.command {
-        Command::Addrm { name, ttl, file } => {
-            let mut req = format!("ADDRM \"{name}\"");
+        Command::Addrm { names, ttl, file } => {
+            require_single_for_file(file.as_deref(), names.len());
+            let mut req = batch_request("ADDRM", &[], names);
             if let Some(t) = ttl {
                 req.push_str(&format!(" TTL {t}"));
             }
             match send_request(&socket_path, &req).await {
-                Ok(response) => handle_addrm_response(&response, name, file.as_deref(), &token_dir),
+                Ok(response) => handle_addrm_response(&response, file.as_deref(), &token_dir),
                 Err(e) => fatal(e),
             }
         }
-        Command::Delrm { name } => {
-            let req = format!("DELRM \"{name}\"");
+        Command::Delrm { names } => {
+            let req = batch_request("DELRM", &[], names);
             match send_request(&socket_path, &req).await {
                 Ok(response) => handle_delrm_response(&response),
                 Err(e) => fatal(e),
@@ -153,8 +160,8 @@ async fn main() {
                 Err(e) => fatal(e),
             }
         }
-        Command::Kckall { name } => {
-            let req = format!("KCKALL \"{name}\"");
+        Command::Kckall { names } => {
+            let req = batch_request("KCKALL", &[], names);
             match send_request(&socket_path, &req).await {
                 Ok(response) => handle_kckall_response(&response),
                 Err(e) => fatal(e),
@@ -162,23 +169,22 @@ async fn main() {
         }
         Command::AddMember {
             name,
-            member,
+            members,
             ttl,
             file,
         } => {
-            let mut req = format!("ADDMB \"{name}\" \"{member}\"");
+            require_single_for_file(file.as_deref(), members.len());
+            let mut req = batch_request("ADDMB", &[name], members);
             if let Some(t) = ttl {
                 req.push_str(&format!(" TTL {t}"));
             }
             match send_request(&socket_path, &req).await {
-                Ok(response) => {
-                    handle_addmb_response(&response, name, member, file.as_deref(), &token_dir)
-                }
+                Ok(response) => handle_addmb_response(&response, file.as_deref(), &token_dir),
                 Err(e) => fatal(e),
             }
         }
-        Command::DeleteMember { name, member } => {
-            let req = format!("DELMB \"{name}\" \"{member}\"");
+        Command::DeleteMember { name, members } => {
+            let req = batch_request("DELMB", &[name], members);
             match send_request(&socket_path, &req).await {
                 Ok(response) => handle_delmb_response(&response),
                 Err(e) => fatal(e),
@@ -199,6 +205,46 @@ async fn main() {
             Ok(response) => handle_reload_response(&response),
             Err(e) => fatal(e),
         },
+    }
+}
+
+/// Build `COMMAND "<lead>" ... "<item>" ...` with every argument double-quoted.
+fn batch_request(command: &str, lead: &[&String], items: &[String]) -> String {
+    let mut req = command.to_string();
+    for arg in lead.iter().copied().chain(items.iter()) {
+        req.push_str(&format!(" \"{arg}\""));
+    }
+    req
+}
+
+/// `--file` names one token file, so it cannot be applied to several items.
+fn require_single_for_file(file: Option<&str>, count: usize) {
+    if file.is_some() && count > 1 {
+        eprintln!("error: --file names a single token file and cannot be used with {count} names");
+        std::process::exit(2);
+    }
+}
+
+/// Split a (possibly multi-line) mgmt response into its per-item lines, printing
+/// each `-` failure line as it is met. Returns the `+` lines and whether any
+/// item failed; the caller finishes by calling `exit_if_failed`.
+fn split_batch_response(response: &str) -> (Vec<&str>, bool) {
+    let mut ok_lines = Vec::new();
+    let mut failed = false;
+    for line in response.lines().filter(|l| !l.is_empty()) {
+        if let Some(msg) = line.strip_prefix('-') {
+            eprintln!("Server error: {msg}");
+            failed = true;
+        } else {
+            ok_lines.push(line.strip_prefix('+').unwrap_or(line));
+        }
+    }
+    (ok_lines, failed)
+}
+
+fn exit_if_failed(failed: bool) {
+    if failed {
+        std::process::exit(1);
     }
 }
 
@@ -309,31 +355,44 @@ async fn send_request(socket_path: &Path, request: &str) -> Result<String, Strin
 
 // ── ADDRM ─────────────────────────────────────────────────────────────────────
 
-fn handle_addrm_response(response: &str, name: &str, file_hint: Option<&str>, token_dir: &Path) {
-    if let Some(msg) = response.strip_prefix('+') {
-        // +ROOM_CREATED "<name>" <token> <expires_unix>
+fn handle_addrm_response(response: &str, file_hint: Option<&str>, token_dir: &Path) {
+    let (ok_lines, failed) = split_batch_response(response);
+    for msg in ok_lines {
+        // ROOM_CREATED "<name>" <token> <expires_unix>
         let fields = parse_quoted_line(msg);
         if fields.first().map(|s| s.as_str()) == Some("ROOM_CREATED") && fields.len() >= 3 {
+            let name = &fields[1];
             let token = &fields[2];
             let expires = fields.get(3).map(|s| s.as_str()).unwrap_or("?");
-            let tok_path = write_token_file(name, token, file_hint, token_dir);
+            let (tok_path, reused) = write_token_file(name, token, file_hint, token_dir);
             println!("Room created.");
             println!("  Name:       {name}");
-            println!("  Token file: {}", tok_path.display());
+            println!("  Token file: {}{}", tok_path.display(), reuse_note(reused));
             println!("  Expires:    {}", format_unix_ts(expires));
         } else {
             println!("{msg}");
         }
-    } else if let Some(msg) = response.strip_prefix('-') {
-        eprintln!("Server error: {msg}");
-        std::process::exit(1);
+    }
+    exit_if_failed(failed);
+}
+
+/// Suffix for a printed token path when an identical file was already there.
+fn reuse_note(reused: bool) -> &'static str {
+    if reused {
+        " (unchanged: identical file already present)"
     } else {
-        println!("{response}");
+        ""
     }
 }
 
 /// Write a 2-line room token file under `token_dir` with mode 0600. Returns the path.
-fn write_token_file(name: &str, token: &str, file_hint: Option<&str>, token_dir: &Path) -> PathBuf {
+/// The flag is `true` when an identical file already existed and none was written.
+fn write_token_file(
+    name: &str,
+    token: &str,
+    file_hint: Option<&str>,
+    token_dir: &Path,
+) -> (PathBuf, bool) {
     let base = sanitize_filename(file_hint.unwrap_or(name));
     let content = format!("{name}\n{token}\n");
     write_token_file_inner(token_dir, &base, &content, name)
@@ -342,10 +401,15 @@ fn write_token_file(name: &str, token: &str, file_hint: Option<&str>, token_dir:
 // ── DELRM ─────────────────────────────────────────────────────────────────────
 
 fn handle_delrm_response(response: &str) {
-    if let Some(msg) = response.strip_prefix('+') {
+    let (ok_lines, failed) = split_batch_response(response);
+    for msg in ok_lines {
+        // ROOM_DELETED "<name>" evicted:<count>
         let fields = parse_quoted_line(msg);
         if fields.first().map(|s| s.as_str()) == Some("ROOM_DELETED") {
-            println!("Room deleted.");
+            println!(
+                "Room deleted: {}",
+                fields.get(1).map(|s| s.as_str()).unwrap_or("?")
+            );
             for field in &fields[1..] {
                 if let Some(n) = field.strip_prefix("evicted:") {
                     println!("  Members evicted: {n}");
@@ -354,12 +418,8 @@ fn handle_delrm_response(response: &str) {
         } else {
             println!("{msg}");
         }
-    } else if let Some(msg) = response.strip_prefix('-') {
-        eprintln!("Server error: {msg}");
-        std::process::exit(1);
-    } else {
-        println!("{response}");
     }
+    exit_if_failed(failed);
 }
 
 // ── LSRM ──────────────────────────────────────────────────────────────────────
@@ -491,57 +551,49 @@ fn handle_kckm_response(response: &str) {
 // ── KCKALL ────────────────────────────────────────────────────────────────────
 
 fn handle_kckall_response(response: &str) {
-    if let Some(msg) = response.strip_prefix('+') {
-        // +KICKED_ALL "<room>" evicted:N
+    let (ok_lines, failed) = split_batch_response(response);
+    for msg in ok_lines {
+        // KICKED_ALL "<room>" evicted:N
         let fields = parse_quoted_line(msg);
         if fields.first().map(|s| s.as_str()) == Some("KICKED_ALL") {
             let count = fields
                 .iter()
                 .find_map(|f| f.strip_prefix("evicted:"))
                 .unwrap_or("?");
-            println!("All members kicked.");
+            println!(
+                "All members kicked: {}",
+                fields.get(1).map(|s| s.as_str()).unwrap_or("?")
+            );
             println!("  Members evicted: {count}");
         } else {
             println!("{msg}");
         }
-    } else if let Some(msg) = response.strip_prefix('-') {
-        eprintln!("Server error: {msg}");
-        std::process::exit(1);
-    } else {
-        println!("{response}");
     }
+    exit_if_failed(failed);
 }
 
 // ── ADDMB ─────────────────────────────────────────────────────────────────────
 
-fn handle_addmb_response(
-    response: &str,
-    room: &str,
-    member: &str,
-    file_hint: Option<&str>,
-    token_dir: &Path,
-) {
-    if let Some(msg) = response.strip_prefix('+') {
-        // +SEAT_CREATED "<room>" "<member>" <seat_token> <expires_unix>
+fn handle_addmb_response(response: &str, file_hint: Option<&str>, token_dir: &Path) {
+    let (ok_lines, failed) = split_batch_response(response);
+    for msg in ok_lines {
+        // SEAT_CREATED "<room>" "<member>" <seat_token> <expires_unix>
         let fields = parse_quoted_line(msg);
         if fields.first().map(|s| s.as_str()) == Some("SEAT_CREATED") && fields.len() >= 4 {
-            let seat_token = &fields[3];
+            let (room, member, seat_token) = (&fields[1], &fields[2], &fields[3]);
             let expires = fields.get(4).map(|s| s.as_str()).unwrap_or("?");
-            let tok_path = write_seat_token_file(room, member, seat_token, file_hint, token_dir);
+            let (tok_path, reused) =
+                write_seat_token_file(room, member, seat_token, file_hint, token_dir);
             println!("Seat token created.");
             println!("  Room:       {room}");
             println!("  Member:     {member}");
-            println!("  Token file: {}", tok_path.display());
+            println!("  Token file: {}{}", tok_path.display(), reuse_note(reused));
             println!("  Expires:    {}", format_unix_ts(expires));
         } else {
             println!("{msg}");
         }
-    } else if let Some(msg) = response.strip_prefix('-') {
-        eprintln!("Server error: {msg}");
-        std::process::exit(1);
-    } else {
-        println!("{response}");
     }
+    exit_if_failed(failed);
 }
 
 /// Write a 3-line seat token file at `token_dir/user/<room>/<member>.tok`, mode 0600.
@@ -558,7 +610,7 @@ fn write_seat_token_file(
     seat_token: &str,
     file_hint: Option<&str>,
     token_dir: &Path,
-) -> PathBuf {
+) -> (PathBuf, bool) {
     let room_dir = token_dir.join("user").join(sanitize_filename(room));
     let base = sanitize_filename(file_hint.unwrap_or(member));
     let content = format!("{room}\n{member}\n{seat_token}\n");
@@ -568,22 +620,22 @@ fn write_seat_token_file(
 // ── DELMB ─────────────────────────────────────────────────────────────────────
 
 fn handle_delmb_response(response: &str) {
-    if let Some(msg) = response.strip_prefix('+') {
-        // +SEAT_DELETED "<room>" "<member>"
+    let (ok_lines, failed) = split_batch_response(response);
+    let mut deleted = 0;
+    for msg in ok_lines {
+        // SEAT_DELETED "<room>" "<member>"
         let fields = parse_quoted_line(msg);
         if fields.first().map(|s| s.as_str()) == Some("SEAT_DELETED") && fields.len() >= 3 {
-            println!("Seat token deleted.");
-            println!("  Member: {}", fields[2]);
-            println!("  Note: local token file (if any) was NOT removed.");
+            println!("Seat token deleted: {}", fields[2]);
+            deleted += 1;
         } else {
             println!("{msg}");
         }
-    } else if let Some(msg) = response.strip_prefix('-') {
-        eprintln!("Server error: {msg}");
-        std::process::exit(1);
-    } else {
-        println!("{response}");
     }
+    if deleted > 0 {
+        println!("  Note: local token files (if any) were NOT removed.");
+    }
+    exit_if_failed(failed);
 }
 
 // ── LSMB ──────────────────────────────────────────────────────────────────────
@@ -703,7 +755,7 @@ fn open_token_file(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Shared inner writer: collision-safe, permissioned token file creation.
 /// Finds a free path under `dir` with base `base`, writes `content`, returns the path.
-fn write_token_file_inner(dir: &Path, base: &str, content: &str, label: &str) -> PathBuf {
+fn write_token_file_inner(dir: &Path, base: &str, content: &str, label: &str) -> (PathBuf, bool) {
     use std::io::Write;
 
     if let Err(e) = std::fs::create_dir_all(dir) {
@@ -713,23 +765,28 @@ fn write_token_file_inner(dir: &Path, base: &str, content: &str, label: &str) ->
         );
     }
 
-    let candidate = dir.join(format!("{base}.tok"));
-    let path = if !candidate.exists() {
-        candidate
-    } else {
-        match (1..=999)
-            .map(|n| dir.join(format!("{base}_{n}.tok")))
-            .find(|p| !p.exists())
-        {
-            Some(p) => p,
-            None => {
-                eprintln!(
-                    "error: no free token filename for '{label}' in {}",
-                    dir.display()
-                );
-                std::process::exit(1);
-            }
+    // Walk `<base>.tok`, `<base>_1.tok`, … : the first identical file is reused
+    // (re-running a command must not litter near-duplicates), the first free slot
+    // is where a new file goes.
+    let names =
+        std::iter::once(format!("{base}.tok")).chain((1..=999).map(|n| format!("{base}_{n}.tok")));
+    let mut path = None;
+    for name in names {
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            path = Some(candidate);
+            break;
         }
+        if std::fs::read_to_string(&candidate).is_ok_and(|existing| existing == content) {
+            return (candidate, true);
+        }
+    }
+    let Some(path) = path else {
+        eprintln!(
+            "error: no free token filename for '{label}' in {}",
+            dir.display()
+        );
+        std::process::exit(1);
     };
 
     match open_token_file(&path) {
@@ -749,7 +806,7 @@ fn write_token_file_inner(dir: &Path, base: &str, content: &str, label: &str) ->
         }
     }
 
-    path
+    (path, false)
 }
 
 /// Convert a raw Unix timestamp string (e.g. "1749340800") to a human-readable
@@ -798,7 +855,8 @@ mod tests {
     fn test_seat_token_file_path_layout() {
         // Default layout: tokens/user/<room>/<member>.tok with the 3-line body.
         let dir = tempfile::TempDir::new().unwrap();
-        let path = write_seat_token_file("qa-room", "alice", "tok-abc", None, dir.path());
+        let (path, reused) = write_seat_token_file("qa-room", "alice", "tok-abc", None, dir.path());
+        assert!(!reused);
         assert_eq!(
             path,
             dir.path().join("user").join("qa-room").join("alice.tok")
@@ -814,8 +872,8 @@ mod tests {
         // A second seat for the same room+member gets a numeric suffix in the
         // same room subdirectory, not an overwrite.
         let dir = tempfile::TempDir::new().unwrap();
-        let p1 = write_seat_token_file("room1", "bob", "t1", None, dir.path());
-        let p2 = write_seat_token_file("room1", "bob", "t2", None, dir.path());
+        let (p1, _) = write_seat_token_file("room1", "bob", "t1", None, dir.path());
+        let (p2, _) = write_seat_token_file("room1", "bob", "t2", None, dir.path());
         assert_eq!(p1, dir.path().join("user").join("room1").join("bob.tok"));
         assert_eq!(p2, dir.path().join("user").join("room1").join("bob_1.tok"));
     }
@@ -824,10 +882,44 @@ mod tests {
     fn test_seat_token_file_hint_overrides_member_filename() {
         // --file overrides the member-name filename but keeps the room subdirectory.
         let dir = tempfile::TempDir::new().unwrap();
-        let path = write_seat_token_file("room1", "carol", "tok", Some("custom"), dir.path());
+        let (path, _) = write_seat_token_file("room1", "carol", "tok", Some("custom"), dir.path());
         assert_eq!(
             path,
             dir.path().join("user").join("room1").join("custom.tok")
         );
+    }
+
+    #[test]
+    fn test_seat_token_file_identical_content_is_reused() {
+        // Re-running addmb with the same credential must not write bob_1.tok.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (p1, r1) = write_seat_token_file("room1", "bob", "t1", None, dir.path());
+        let (p2, r2) = write_seat_token_file("room1", "bob", "t1", None, dir.path());
+        assert!(!r1 && r2, "second identical write must be reported reused");
+        assert_eq!(p1, p2);
+        assert!(!p1.with_file_name("bob_1.tok").exists());
+    }
+
+    #[test]
+    fn test_seat_token_file_reuses_identical_suffixed_file() {
+        // bob.tok differs, bob_1.tok matches: reuse bob_1.tok rather than make bob_2.tok.
+        let dir = tempfile::TempDir::new().unwrap();
+        write_seat_token_file("room1", "bob", "t1", None, dir.path());
+        let (p2, _) = write_seat_token_file("room1", "bob", "t2", None, dir.path());
+        let (p3, reused) = write_seat_token_file("room1", "bob", "t2", None, dir.path());
+        assert!(reused);
+        assert_eq!(p2, p3);
+    }
+
+    #[test]
+    fn test_room_token_file_identical_content_is_reused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (p1, _) = write_token_file("alpha", "tok", None, dir.path());
+        let (p2, reused) = write_token_file("alpha", "tok", None, dir.path());
+        assert!(reused);
+        assert_eq!(p1, p2);
+        let (p3, reused) = write_token_file("alpha", "other", None, dir.path());
+        assert!(!reused);
+        assert_eq!(p3, dir.path().join("alpha_1.tok"));
     }
 }
