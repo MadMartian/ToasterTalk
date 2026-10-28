@@ -1,14 +1,14 @@
 # ToasterTalk — DEV / MANUAL-TEST instance configuration.
 #
 # This is NOT for production. It runs a throwaway instance from the repo (via
-# `make dev-up`) on port 6668, fully isolated from any systemd/production
+# `make dev-up`) on port 6678, fully isolated from any systemd/production
 # instance on 6669. All mutable state lives under /tmp/toaster-talk-dev/ and
 # target/dev-instance/ (both ephemeral / gitignored).
 #
 # See toaster-talk-server/tests/MANUAL-TEST.md for the workflow.
 
 bind        = "127.0.0.1"                       # localhost only — never expose the dev instance
-port        = 6668                              # dev port (prod is 6669)
+port        = 6678                              # dev port (TEMP: moved off 6668, which an ssh forward holds; prod is 6669)
 log_level   = "debug"                           # verbose: manual tests read the logs
 mgmt_socket = "/tmp/toaster-talk-dev/mgmt.sock"
 

@@ -6,9 +6,9 @@ of truth for scenarios, expected dump signatures, and the probe brief template.
 
 ## Environment (already set up for you)
 - You are in a `--strict-mcp-config` session: the ONLY MCP server you see is
-  `ToasterTalkDev` (http://localhost:6668/sse). Prod is unreachable by design.
+  `ToasterTalkDev` (http://localhost:6678/sse). Prod is unreachable by design.
 - The dev instance is (or should be) running via `make dev-up`. Verify with
-  `make dev-status`; if down, run `make dev-up` and wait for "UP on :6668".
+  `make dev-status`; if down, run `make dev-up` and wait for "UP on :6678".
 - Dev CLI (management): `target/release/toaster-talk-cli --socket
   /tmp/toaster-talk-dev/mgmt.sock --token-dir target/dev-instance/tokens`
 - **Scratch space**: if you or a probe need to write ANY transient file — a

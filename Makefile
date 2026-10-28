@@ -19,7 +19,7 @@ build:
 	cargo build --release
 
 # ── Manual-test dev instance (isolated from prod :6669) ───────────────────────
-# Runs a throwaway server from the repo on :6668 with all state under
+# Runs a throwaway server from the repo on :6678 with all state under
 # $(DEV_TMP) and $(DEV_STATE) (ephemeral / gitignored). See
 # toaster-talk-server/tests/MANUAL-TEST.md.
 
@@ -33,10 +33,10 @@ dev-up: build
 	@rm -f $(DEV_TMP)/rooms.yaml
 	@nohup target/release/toaster-talk-server --config deploy/config.dev.toml \
 		> $(DEV_STATE)/dev.log 2>&1 & echo $$! > $(DEV_STATE)/dev.pid
-	@echo "dev instance starting (PID $$(cat $(DEV_STATE)/dev.pid)); waiting for :6668 ..."
+	@echo "dev instance starting (PID $$(cat $(DEV_STATE)/dev.pid)); waiting for :6678 ..."
 	@for i in $$(seq 1 40); do \
 		if $(DEV_CLI) lsrm >/dev/null 2>&1; then \
-			echo "dev instance UP on :6668 (mgmt: $(DEV_SOCK))"; exit 0; fi; \
+			echo "dev instance UP on :6678 (mgmt: $(DEV_SOCK))"; exit 0; fi; \
 		sleep 0.25; \
 	done; echo "ERROR: dev instance not ready — see $(DEV_STATE)/dev.log"; exit 1
 
