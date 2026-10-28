@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     rooms::{RoomStore, RoomToken},
-    state::{AuthMethod, SharedAppState},
+    state::{AuthMethod, MemberName, SharedAppState},
 };
 use arc_swap::ArcSwap;
 use std::{
@@ -122,7 +122,7 @@ pub async fn do_sweep(
 
         // Collect victims first, then evict — never mutate while iterating. A member
         // parked in a live receive is always skipped (see the block comment above).
-        let mut victims: Vec<(RoomToken, String, &'static str)> = Vec::new();
+        let mut victims: Vec<(RoomToken, MemberName, &'static str)> = Vec::new();
         for (room_token, room_state) in &app_write.rooms {
             for (member_name, member) in &room_state.members {
                 if member.inbox.is_receive_active() {
@@ -170,6 +170,22 @@ pub async fn do_sweep(
             .await;
         if reaped > 0 {
             info!(count = reaped, "TTL sweep: idle roomless sessions reaped");
+        }
+    }
+
+    // ── Step 6: prune stale seat-contention history ──────────────────────────
+    //
+    // A seat's flap history is kept only while it is frozen or still holds a
+    // supersession inside its detection window; past that it carries no signal,
+    // so drop it (every piece of server data has a TTL).
+    {
+        let mut app_write = app.write().await;
+        let pruned = app_write.prune_seat_flaps(now);
+        if pruned > 0 {
+            debug!(
+                count = pruned,
+                "TTL sweep: stale seat-contention history pruned"
+            );
         }
     }
 }

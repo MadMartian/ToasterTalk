@@ -254,9 +254,9 @@ Requires `seat_idle_ttl_secs` set (dev config uses 15s) **and** the reaper sweep
 preempts (aborts) the first. The preempted call returns an empty batch — and it must
 say so honestly with `timeout: preempted`, NOT `none` (which the schema defines as
 "messages returned", so an agent could mistake it for a real empty delivery) and NOT
-`elapsed` (which claims the full wait ran). One `receive` already drains every queued
-message in a single batch, so a second concurrent wait is pointless — the status is
-how an agent learns that.
+`elapsed` (which claims the full wait ran). One inbox has one receive slot, so a second
+concurrent wait is pointless (a backlog larger than `max_receive_batch` is drained by
+sequential receives, not concurrent ones) — the status is how an agent learns that.
 
 **⚠️ How to actually reproduce this — a single agent CANNOT.** The Claude Code MCP SSE
 client **serializes same-session calls** (single in-flight): two `receive` calls issued

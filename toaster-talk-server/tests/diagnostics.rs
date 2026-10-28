@@ -88,11 +88,11 @@ async fn dump_includes_all_live_state_as_valid_yaml() {
 
     // TDD 13.6: the full session token never appears — only its 8-char prefix.
     assert!(
-        !body.contains(&session),
+        !body.contains(session.as_str()),
         "full session token must not appear in the dump"
     );
     assert!(
-        body.contains(&session[..8]),
+        body.contains(&session.as_str()[..8]),
         "redacted session prefix should appear in the dump"
     );
     // TDD 13.6: the room token never appears in any form.

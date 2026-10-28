@@ -1,4 +1,9 @@
-use crate::{error::Error, rooms::RoomToken, tools::session_id};
+use crate::{
+    error::Error,
+    rooms::{impl_str_newtype, RoomToken},
+    tools::session_id,
+};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
@@ -11,8 +16,89 @@ use toaster_talk_common::ct_str_eq;
 use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
-pub type SessionToken = String;
-pub type MemberName = String;
+// ── SessionToken / MemberName ────────────────────────────────────────────────
+
+/// A session credential minted by `connect`. Newtype over `String` so the
+/// compiler rejects transposing it with a member name, room token, or seat token.
+///
+/// Credential-grade: `Debug` and `Display` print only the redacted 8-char
+/// [`session_id`] prefix, and there is deliberately no `Deref<Target = str>`, so
+/// the full value is reachable only through an explicit, greppable
+/// [`SessionToken::as_str`]. In-memory only — it is never persisted, so it has no
+/// serde impls. `From<String>` is unchecked: a caller-supplied string that is not
+/// a live token simply fails to resolve in `AppState`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SessionToken(String);
+
+impl_str_newtype!(SessionToken);
+
+impl From<String> for SessionToken {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for SessionToken {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl std::fmt::Display for SessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(session_id(&self.0))
+    }
+}
+
+impl std::fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SessionToken({}…)", session_id(&self.0))
+    }
+}
+
+/// A member's name within a room. Newtype over `String` so it cannot be
+/// transposed with a session token or room token.
+///
+/// [`MemberName::new`] is the only in-code constructor and enforces the
+/// member-name rules (non-empty, at most 40 chars, `[a-zA-Z0-9_-]`), so a name
+/// built in code is valid by construction. `Deserialize` is `#[serde(transparent)]`
+/// and unvalidated, keeping the persisted seat YAML byte-identical and the store's
+/// load behaviour unchanged; the store only ever writes names that passed `new`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MemberName(String);
+
+impl_str_newtype!(MemberName);
+
+impl MemberName {
+    /// Validate `name` against the member-name rules and wrap it.
+    pub fn new(name: impl Into<String>) -> Result<Self, Error> {
+        let name = name.into();
+        if toaster_talk_common::is_valid_member_name(&name) {
+            Ok(Self(name))
+        } else {
+            Err(Error::InvalidMemberName(name))
+        }
+    }
+
+    /// Unwrap into the underlying `String` (for error payloads and wire output).
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::ops::Deref for MemberName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MemberName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 // ── AuthMethod ────────────────────────────────────────────────────────────────
 
@@ -68,6 +154,15 @@ pub struct QueuedMessage {
 }
 
 // ── Inbox ─────────────────────────────────────────────────────────────────────
+
+/// Result of a bounded inbox drain: the messages taken, plus how many further
+/// still-valid messages matching the same filter were left queued because the
+/// per-call cap was reached.
+#[derive(Debug, Default)]
+pub struct Drained {
+    pub messages: Vec<QueuedMessage>,
+    pub remaining: usize,
+}
 
 /// Each session's private message queue — shared across every room membership
 /// that session holds: one agent, however many rooms it has joined, drains one
@@ -187,27 +282,61 @@ impl Inbox {
     /// Drain all messages that have not yet expired **and** whose room tag
     /// satisfies `filter`. A still-valid message that does not match `filter` is
     /// left queued, not dropped — this is the primitive behind `receive`'s
-    /// optional room filter and send-with-reply's mandatory one.
+    /// optional room filter and send-with-reply's mandatory one. Unbounded:
+    /// convenience wrapper over [`Inbox::drain_valid_filtered_capped`].
     pub async fn drain_valid_filtered(
         &self,
         now: Instant,
         filter: impl Fn(&RoomToken) -> bool + Send + Sync,
     ) -> Vec<QueuedMessage> {
+        self.drain_valid_filtered_capped(now, filter, usize::MAX)
+            .await
+            .messages
+    }
+
+    /// Drain at most `limit` messages that have not yet expired **and** whose
+    /// room tag satisfies `filter`, oldest first. Matching messages beyond
+    /// `limit` stay queued in their original order (as do non-matching ones), so
+    /// the next drain picks up exactly where this one stopped — FIFO is preserved
+    /// and nothing is lost. Expired messages are dropped wherever they sit in the
+    /// queue, same as the unbounded drain.
+    ///
+    /// The returned [`Drained::remaining`] is the number of still-valid messages
+    /// matching `filter` left queued, counted under the same queue lock as the
+    /// drain — this is what lets `receive` tell its caller "more is waiting".
+    /// A `limit` of `0` is treated as `1`: a drain that could never return
+    /// anything would strand a parked waiter in a busy loop.
+    pub async fn drain_valid_filtered_capped(
+        &self,
+        now: Instant,
+        filter: impl Fn(&RoomToken) -> bool + Send + Sync,
+        limit: usize,
+    ) -> Drained {
+        let limit = limit.max(1);
         let mut q = self.queue.lock().await;
         let mut matched = Vec::new();
-        let mut remaining = VecDeque::with_capacity(q.len());
+        let mut remaining_matching = 0usize;
+        let mut kept = VecDeque::with_capacity(q.len());
         for m in q.drain(..) {
             if m.expires_at <= now {
                 continue; // expired — dropped regardless of room, same as before
             }
             if filter(&m.room) {
-                matched.push(m);
+                if matched.len() < limit {
+                    matched.push(m);
+                } else {
+                    remaining_matching += 1;
+                    kept.push_back(m);
+                }
             } else {
-                remaining.push_back(m);
+                kept.push_back(m);
             }
         }
-        *q = remaining;
-        matched
+        *q = kept;
+        Drained {
+            messages: matched,
+            remaining: remaining_matching,
+        }
     }
 
     /// Drain all messages that have not yet expired, regardless of room.
@@ -237,44 +366,52 @@ impl Inbox {
     }
 
     /// Block until at least one valid message matching `filter` is available or
-    /// `deadline` elapses. Returns all such messages currently in the queue on
-    /// wakeup (leaving non-matching valid messages queued), or an empty vec if the
-    /// deadline passed before any matching message arrived.
+    /// `deadline` elapses. Returns up to `limit` such messages (oldest first) on
+    /// wakeup, leaving any further matching messages — and every non-matching
+    /// valid one — queued in order; or an empty [`Drained`] if the deadline passed
+    /// before any matching message arrived. Because the queue is checked before
+    /// parking, a call made while matching messages are already queued (e.g. the
+    /// remainder of a previous capped drain) returns immediately.
     pub async fn wait_drain_until_filtered(
         &self,
         deadline: Instant,
         filter: impl Fn(&RoomToken) -> bool + Send + Sync,
-    ) -> Vec<QueuedMessage> {
+        limit: usize,
+    ) -> Drained {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
 
-            let messages = self.drain_valid_filtered(Instant::now(), &filter).await;
-            if !messages.is_empty() {
-                return messages;
+            let drained = self
+                .drain_valid_filtered_capped(Instant::now(), &filter, limit)
+                .await;
+            if !drained.messages.is_empty() {
+                return drained;
             }
 
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or(Duration::ZERO);
             if remaining.is_zero() {
-                return vec![];
+                return Drained::default();
             }
 
             tokio::select! {
                 _ = &mut notified => {}
                 _ = tokio::time::sleep(remaining) => {
-                    return vec![];
+                    return Drained::default();
                 }
             }
         }
     }
 
     /// Block until at least one valid message (any room) is available or
-    /// `deadline` elapses. Convenience wrapper over
+    /// `deadline` elapses, draining everything. Convenience wrapper over
     /// [`Inbox::wait_drain_until_filtered`].
     pub async fn wait_drain_until(&self, deadline: Instant) -> Vec<QueuedMessage> {
-        self.wait_drain_until_filtered(deadline, |_| true).await
+        self.wait_drain_until_filtered(deadline, |_| true, usize::MAX)
+            .await
+            .messages
     }
 
     /// Remove expired messages in-place (called by TTL sweeper).
@@ -508,6 +645,19 @@ pub struct MemberSnapshot {
     /// Seconds until idle eviction for a room-token member, or `None` when the
     /// member is exempt (seat-authed) and never idle-evicted.
     pub idle_countdown_secs: Option<u64>,
+    /// Seat-contention view for this (room, member) seat — `None` for room-token
+    /// members, which are never superseded.
+    pub seat_contention: Option<SeatContentionSnapshot>,
+}
+
+/// Per-seat flap-detection state as shown in `DUMP`.
+pub struct SeatContentionSnapshot {
+    /// Supersessions inside the detection window right now.
+    pub recent_supersedes: usize,
+    /// Seconds since the most recent supersession, `None` if none is on record.
+    pub last_supersede_secs_ago: Option<u64>,
+    /// Seconds left on the freeze, `None` when the seat is not frozen.
+    pub frozen_secs_remaining: Option<u64>,
 }
 
 /// A room and its members (TDD 13.2). The room token is never included.
@@ -562,6 +712,83 @@ pub enum MembershipCheck {
     Superseded,
 }
 
+// ── Seat-contention flap detection ────────────────────────────────────────────
+
+/// Tunables for seat-contention flap detection, snapshotted from the live
+/// `Config` per `join` call. A seat superseded MORE than `threshold` times within
+/// `window` is frozen for `hold_down`. `threshold == 0` disables detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeatFlapPolicy {
+    pub threshold: u32,
+    pub window: Duration,
+    pub hold_down: Duration,
+}
+
+impl SeatFlapPolicy {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            threshold: config.seat_flap_threshold,
+            window: Duration::from_secs(config.seat_flap_window_secs),
+            hold_down: Duration::from_secs(config.seat_flap_hold_down_secs),
+        }
+    }
+}
+
+impl Default for SeatFlapPolicy {
+    /// The default-config values: freeze on the 4th supersession within 30 s, for
+    /// 60 s.
+    fn default() -> Self {
+        Self {
+            threshold: 3,
+            window: Duration::from_secs(30),
+            hold_down: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Per-seat (`room_token`, `member_name`) supersession history. Lives outside
+/// `MemberState` because every supersede replaces the `MemberState` — the history
+/// must outlive any one holder. Pruned by the TTL sweep once it is neither frozen
+/// nor carrying a supersession inside its window, so it never accumulates.
+#[derive(Debug, Clone)]
+pub struct SeatFlap {
+    /// Supersession instants still inside `window` (oldest first; pruned lazily).
+    pub supersedes: VecDeque<Instant>,
+    /// Most recent supersession, kept even after it ages out of `supersedes`.
+    pub last_supersede: Instant,
+    /// The window in force when the last supersession was recorded — lets the
+    /// sweep and the dump judge staleness without consulting the live config.
+    pub window: Duration,
+    /// `Some(t)` while the seat is frozen: superseding joins are rejected until `t`.
+    pub frozen_until: Option<Instant>,
+}
+
+impl SeatFlap {
+    /// Supersessions inside the window as of `now`, without mutating (dump-safe).
+    pub fn recent_count(&self, now: Instant) -> usize {
+        self.supersedes
+            .iter()
+            .filter(|t| now.saturating_duration_since(**t) <= self.window)
+            .count()
+    }
+
+    /// Remaining freeze as of `now`, or `None` when not (or no longer) frozen.
+    pub fn frozen_remaining(&self, now: Instant) -> Option<Duration> {
+        self.frozen_until
+            .filter(|until| *until > now)
+            .map(|until| until - now)
+    }
+}
+
+/// Outcome of [`AppState::record_seat_supersede`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlapOutcome {
+    /// Recorded; still at or under the threshold (or detection disabled).
+    Counted(usize),
+    /// This supersession pushed the seat over the threshold; it is now frozen.
+    Frozen { count: usize, hold_down: Duration },
+}
+
 // ── AppState ──────────────────────────────────────────────────────────────────
 
 /// In-memory agent registrations and message queues.
@@ -594,6 +821,9 @@ pub struct AppState {
     /// Session tokens that have been superseded by a seat-holder eviction.
     /// One-time delivery: the token is removed from this set on first `Superseded` error.
     pub superseded_sessions: HashSet<SessionToken>,
+    /// Seat-contention flap history keyed by `(room_token, member_name)`. Only
+    /// seat-token supersessions are recorded here; see [`SeatFlap`].
+    pub seat_flaps: HashMap<(RoomToken, MemberName), SeatFlap>,
 }
 
 pub type SharedAppState = Arc<RwLock<AppState>>;
@@ -627,7 +857,7 @@ impl AppState {
         &mut self,
         room_token: RoomToken,
         member_name: MemberName,
-        session_token: &str,
+        session_token: &SessionToken,
         now: Instant,
         auth: AuthMethod,
     ) {
@@ -641,12 +871,12 @@ impl AppState {
                 );
                 let ib = Inbox::new();
                 self.session_inboxes
-                    .insert(session_token.to_string(), ib.clone());
+                    .insert(session_token.clone(), ib.clone());
                 ib
             }
         };
         let member_state = MemberState {
-            session_token: session_token.to_string(),
+            session_token: session_token.clone(),
             member_name: member_name.clone(),
             registered_at: now,
             last_seen: now,
@@ -659,7 +889,7 @@ impl AppState {
             .members
             .insert(member_name.clone(), member_state);
         self.sessions
-            .entry(session_token.to_string())
+            .entry(session_token.clone())
             .or_default()
             .insert((room_token, member_name));
     }
@@ -673,7 +903,7 @@ impl AppState {
     /// eviction (idle TTL, `kckm`, room expiry, seat supersede) never calls this;
     /// it goes through [`AppState::evict_member`] and friends, which only tear
     /// down the whole session when the *last* membership is the one being removed.
-    pub async fn invalidate_session_fully(&mut self, session_token: &str) {
+    pub async fn invalidate_session_fully(&mut self, session_token: &SessionToken) {
         let Some(memberships) = self.sessions.remove(session_token) else {
             return;
         };
@@ -753,14 +983,14 @@ impl AppState {
     async fn evict_one(
         &mut self,
         room_name: &str,
-        member_name: &str,
-        session_token: &str,
+        member_name: &MemberName,
+        session_token: &SessionToken,
         room_token: &RoomToken,
         reason: &str,
     ) {
         let mut session_emptied = false;
         if let Some(set) = self.sessions.get_mut(session_token) {
-            set.remove(&(room_token.clone(), member_name.to_string()));
+            set.remove(&(room_token.clone(), member_name.clone()));
             session_emptied = set.is_empty();
         }
 
@@ -800,7 +1030,7 @@ impl AppState {
         &mut self,
         room_token: &str,
         room_name: &str,
-        member_name: &str,
+        member_name: &MemberName,
         reason: &str,
     ) -> bool {
         let member_state = match self.rooms.get_mut(room_token) {
@@ -830,7 +1060,7 @@ impl AppState {
         room_name: &str,
         reason: &str,
     ) -> usize {
-        let members: Vec<(String, MemberState)> = match self.rooms.get_mut(room_token) {
+        let members: Vec<(MemberName, MemberState)> = match self.rooms.get_mut(room_token) {
             Some(rs) => rs.members.drain().collect(),
             None => return 0,
         };
@@ -852,6 +1082,8 @@ impl AppState {
     /// Evict all members from a room and remove it from app state.
     /// Returns the number of members evicted. No-op if the room is not in app state.
     pub async fn evict_room(&mut self, room_token: &str, room_name: &str, reason: &str) -> usize {
+        // The room is gone, so is every seat in it: drop their contention history.
+        self.clear_room_seat_flaps(room_token);
         if let Some(room_state) = self.rooms.remove(room_token) {
             let count = room_state.members.len();
             let rt = RoomToken::from(room_token.to_string());
@@ -889,7 +1121,7 @@ impl AppState {
         &mut self,
         room_token: &str,
         room_name: &str,
-        member_name: &str,
+        member_name: &MemberName,
     ) -> Vec<QueuedMessage> {
         let member_state = match self.rooms.get_mut(room_token) {
             Some(rs) => match rs.members.remove(member_name) {
@@ -911,7 +1143,7 @@ impl AppState {
 
         let mut session_emptied = false;
         if let Some(set) = self.sessions.get_mut(&old_session_token) {
-            set.remove(&(rt.clone(), member_name.to_string()));
+            set.remove(&(rt.clone(), member_name.clone()));
             session_emptied = set.is_empty();
         }
 
@@ -937,33 +1169,158 @@ impl AppState {
         carried
     }
 
+    // ── Seat-contention flap detection ────────────────────────────────────────
+
+    /// Remaining freeze on seat `(room_token, member_name)`, or `None` if it is not
+    /// frozen. A freeze that has lapsed is cleared here (along with its window, so
+    /// counting restarts from zero) and logged — the lazy half of expiry; the TTL
+    /// sweep's [`AppState::prune_seat_flaps`] is the other.
+    pub fn seat_freeze_remaining(
+        &mut self,
+        room_token: &str,
+        room_name: &str,
+        member_name: &MemberName,
+        now: Instant,
+    ) -> Option<Duration> {
+        let key = (RoomToken::from(room_token.to_string()), member_name.clone());
+        let flap = self.seat_flaps.get_mut(&key)?;
+        flap.frozen_until?;
+        if let Some(rem) = flap.frozen_remaining(now) {
+            return Some(rem);
+        }
+        flap.frozen_until = None;
+        flap.supersedes.clear();
+        tracing::info!(
+            room = %room_name,
+            member = %member_name,
+            "seat contention freeze lapsed — superseding seat-token joins accepted again"
+        );
+        None
+    }
+
+    /// Record one seat-token supersession of `(room_token, member_name)` at `now`
+    /// and, if it pushes the in-window count over `policy.threshold`, freeze the
+    /// seat for `policy.hold_down` and emit the contention WARN. Cheap: one map
+    /// entry and a deque that never holds more than `threshold + 1` instants per
+    /// window, because the freeze stops further supersessions.
+    pub fn record_seat_supersede(
+        &mut self,
+        room_token: &str,
+        room_name: &str,
+        member_name: &MemberName,
+        now: Instant,
+        policy: SeatFlapPolicy,
+    ) -> FlapOutcome {
+        let key = (RoomToken::from(room_token.to_string()), member_name.clone());
+        let flap = self.seat_flaps.entry(key).or_insert_with(|| SeatFlap {
+            supersedes: VecDeque::new(),
+            last_supersede: now,
+            window: policy.window,
+            frozen_until: None,
+        });
+        flap.last_supersede = now;
+        flap.window = policy.window;
+        flap.supersedes.push_back(now);
+        while let Some(front) = flap.supersedes.front() {
+            if now.saturating_duration_since(*front) > policy.window {
+                flap.supersedes.pop_front();
+            } else {
+                break;
+            }
+        }
+        let count = flap.supersedes.len();
+        if policy.threshold > 0 && count > policy.threshold as usize {
+            flap.frozen_until = Some(now + policy.hold_down);
+            tracing::warn!(
+                room = %room_name,
+                member = %member_name,
+                supersedes_in_window = count,
+                window_secs = policy.window.as_secs(),
+                threshold = policy.threshold,
+                hold_down_secs = policy.hold_down.as_secs(),
+                "seat credential contention — possible shared token: seat superseded too often; \
+                 freezing it (the current holder keeps the seat; further superseding seat-token \
+                 joins are rejected with SeatContention until the hold-down lapses or an operator \
+                 runs kckm/kckall/delmb for this member)"
+            );
+            FlapOutcome::Frozen {
+                count,
+                hold_down: policy.hold_down,
+            }
+        } else {
+            tracing::debug!(
+                room = %room_name,
+                member = %member_name,
+                supersedes_in_window = count,
+                threshold = policy.threshold,
+                "seat supersession recorded for flap detection"
+            );
+            FlapOutcome::Counted(count)
+        }
+    }
+
+    /// Operator clear: drop the contention history (and any freeze) for one seat.
+    /// Returns `true` if the seat was frozen at the time.
+    pub fn clear_seat_flap(
+        &mut self,
+        room_token: &str,
+        member_name: &MemberName,
+        now: Instant,
+    ) -> bool {
+        let key = (RoomToken::from(room_token.to_string()), member_name.clone());
+        self.seat_flaps
+            .remove(&key)
+            .is_some_and(|f| f.frozen_remaining(now).is_some())
+    }
+
+    /// Drop the contention history of every seat in a room (room deleted/expired,
+    /// or `kckall`).
+    pub fn clear_room_seat_flaps(&mut self, room_token: &str) {
+        self.seat_flaps
+            .retain(|(rt, _), _| rt.as_str() != room_token);
+    }
+
+    /// TTL sweep: drop every history that is neither frozen nor holding a
+    /// supersession inside its window. Returns the number removed.
+    pub fn prune_seat_flaps(&mut self, now: Instant) -> usize {
+        let before = self.seat_flaps.len();
+        self.seat_flaps.retain(|_, f| {
+            f.frozen_remaining(now).is_some()
+                || now.saturating_duration_since(f.last_supersede) <= f.window
+        });
+        before - self.seat_flaps.len()
+    }
+
     // ── Session / membership resolution ───────────────────────────────────────
 
     /// True if `token` is a currently registered session (any number of rooms,
     /// including zero — a fresh roomless `connect`).
-    pub fn session_exists(&self, token: &str) -> bool {
+    pub fn session_exists(&self, token: &SessionToken) -> bool {
         self.sessions
             .get_key_value(token)
-            .map(|(stored, _)| ct_str_eq(stored.as_str(), token))
+            .map(|(stored, _)| ct_str_eq(stored.as_str(), token.as_str()))
             .unwrap_or(false)
     }
 
     /// All `(room_token, member_name)` pairs a session belongs to, or `None` if
     /// the session token itself does not resolve.
-    pub fn session_memberships(&self, token: &str) -> Option<&HashSet<(RoomToken, MemberName)>> {
+    pub fn session_memberships(
+        &self,
+        token: &SessionToken,
+    ) -> Option<&HashSet<(RoomToken, MemberName)>> {
         self.sessions
             .get_key_value(token)
-            .filter(|(stored, _)| ct_str_eq(stored.as_str(), token))
+            .filter(|(stored, _)| ct_str_eq(stored.as_str(), token.as_str()))
             .map(|(_, set)| set)
     }
 
     /// The session's shared inbox, or `None` if the session token does not
     /// resolve. Works regardless of how many (if any) rooms the session belongs
     /// to — a fresh roomless session already has one, minted at `connect`.
-    pub fn session_inbox(&self, token: &str) -> Option<Arc<Inbox>> {
+    pub fn session_inbox(&self, token: &SessionToken) -> Option<Arc<Inbox>> {
         self.session_inboxes
             .get_key_value(token)
-            .filter(|(stored, _)| ct_str_eq(stored.as_str(), token))
+            .filter(|(stored, _)| ct_str_eq(stored.as_str(), token.as_str()))
             .map(|(_, inbox)| inbox.clone())
     }
 
@@ -971,7 +1328,7 @@ impl AppState {
     /// consumes a one-time `Superseded` notice if pending, otherwise confirms the
     /// token resolves to a live session. Used by `receive`'s room-omitted path and
     /// by `join`'s up-front session check.
-    pub fn check_session(&mut self, session_token: &str) -> Result<(), Error> {
+    pub fn check_session(&mut self, session_token: &SessionToken) -> Result<(), Error> {
         if self.superseded_sessions.remove(session_token) {
             return Err(Error::Superseded);
         }
@@ -989,7 +1346,7 @@ impl AppState {
     /// [`AppState::room_membership_mut`]).
     pub fn check_room_membership(
         &mut self,
-        session_token: &str,
+        session_token: &SessionToken,
         room_token: &str,
     ) -> MembershipCheck {
         if self.superseded_sessions.remove(session_token) {
@@ -1014,7 +1371,7 @@ impl AppState {
     /// belong to more than one room (`send`, `members`).
     pub fn room_membership_mut(
         &mut self,
-        session_token: &str,
+        session_token: &SessionToken,
         room_token: &str,
         room_name: &str,
     ) -> Result<(MemberName, &mut RoomState), Error> {
@@ -1037,7 +1394,7 @@ impl AppState {
     /// **completion** of an activity that touched specifically this room (`send`,
     /// `members`, or a room-*filtered* `receive`/send-with-reply reply-wait) —
     /// see [`AppState::touch_all_memberships`] for the room-omitted `receive` case.
-    pub fn touch_membership(&mut self, session_token: &str, room_token: &str) {
+    pub fn touch_membership(&mut self, session_token: &SessionToken, room_token: &str) {
         let Some(set) = self.sessions.get(session_token) else {
             return;
         };
@@ -1069,7 +1426,7 @@ impl AppState {
     /// [`AppState::touch_membership`]) — this is specific to the room-omitted
     /// call shape, which by definition represents activity across every room it
     /// was capable of waking for.
-    pub fn touch_all_memberships(&mut self, session_token: &str) {
+    pub fn touch_all_memberships(&mut self, session_token: &SessionToken) {
         let Some(set) = self.sessions.get(session_token).cloned() else {
             return;
         };
@@ -1161,6 +1518,20 @@ impl AppState {
                         .as_secs(),
                     auth_method,
                     idle_countdown_secs,
+                    seat_contention: (member.auth == AuthMethod::Seat).then(|| {
+                        let flap = self
+                            .seat_flaps
+                            .get(&((*room_token).clone(), member_name.clone()));
+                        SeatContentionSnapshot {
+                            recent_supersedes: flap.map_or(0, |f| f.recent_count(now)),
+                            last_supersede_secs_ago: flap
+                                .map(|f| now.saturating_duration_since(f.last_supersede).as_secs()),
+                            frozen_secs_remaining: flap
+                                .and_then(|f| f.frozen_remaining(now))
+                                // Round up so a live freeze never displays as 0.
+                                .map(|d| d.as_secs() + u64::from(d.subsec_nanos() > 0)),
+                        }
+                    }),
                 });
             }
 
@@ -1174,7 +1545,7 @@ impl AppState {
         // ── Sessions: shared inbox rendered once per session (TDD 13.11) ───────
         let mut sessions = Vec::new();
         let mut session_tokens: Vec<&SessionToken> = self.sessions.keys().collect();
-        session_tokens.sort();
+        session_tokens.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
         for session_token in session_tokens {
             let memberships_set = &self.sessions[session_token];
@@ -1219,7 +1590,7 @@ impl AppState {
                     .rooms
                     .get(room_token)
                     .and_then(|rs| rs.members.get(member_name))
-                    .map(|m| ct_str_eq(&m.session_token, session_token))
+                    .map(|m| ct_str_eq(m.session_token.as_str(), session_token.as_str()))
                     .unwrap_or(false);
                 if !resolves {
                     invariants.push(format!(
@@ -1297,8 +1668,86 @@ impl AppState {
 }
 
 #[cfg(test)]
+mod newtype_tests {
+    use super::*;
+
+    const FULL: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // TDD 11.2: member name validation, enforced at construction.
+    #[test]
+    fn member_name_new_accepts_alnum_hyphen_underscore() {
+        assert!(MemberName::new("qa-agent").is_ok());
+        assert!(MemberName::new("dev_01").is_ok());
+    }
+
+    #[test]
+    fn member_name_new_rejects_space() {
+        assert!(matches!(
+            MemberName::new("my name"),
+            Err(Error::InvalidMemberName(n)) if n == "my name"
+        ));
+    }
+
+    #[test]
+    fn member_name_new_rejects_empty() {
+        assert!(matches!(
+            MemberName::new(""),
+            Err(Error::InvalidMemberName(_))
+        ));
+    }
+
+    #[test]
+    fn member_name_new_rejects_too_long() {
+        assert!(matches!(
+            MemberName::new("a".repeat(41)),
+            Err(Error::InvalidMemberName(_))
+        ));
+    }
+
+    #[test]
+    fn session_token_display_shows_only_redacted_prefix() {
+        let token = SessionToken::from(FULL);
+        assert_eq!(token.to_string(), "01234567");
+    }
+
+    #[test]
+    fn session_token_debug_does_not_leak_full_value() {
+        let rendered = format!("{:?}", SessionToken::from(FULL));
+        assert_eq!(rendered, "SessionToken(01234567…)");
+    }
+
+    #[test]
+    fn session_token_redaction_survives_short_and_non_ascii_input() {
+        // Caller-supplied tokens are arbitrary strings; redaction must not panic
+        // on a short one or slice through a multi-byte character.
+        assert_eq!(SessionToken::from("abc").to_string(), "abc");
+        assert_eq!(SessionToken::from("€€€€").to_string(), "€€");
+    }
+
+    #[test]
+    fn session_token_as_str_exposes_full_value() {
+        assert_eq!(SessionToken::from(FULL).as_str(), FULL);
+    }
+
+    #[test]
+    fn member_name_serde_is_transparent_string() {
+        let name = MemberName::new("alice").unwrap();
+        let yaml = serde_yml::to_string(&name).unwrap();
+        assert_eq!(yaml, serde_yml::to_string("alice").unwrap());
+        let back: MemberName = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(back, name);
+    }
+
+    #[test]
+    fn member_name_display_is_the_plain_name() {
+        assert_eq!(MemberName::new("alice").unwrap().to_string(), "alice");
+    }
+}
+
+#[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+    use crate::test_support::mn;
 
     fn rt(s: &str) -> RoomToken {
         RoomToken::from(s.to_string())
@@ -1315,7 +1764,7 @@ mod diagnostic_tests {
         let now = Instant::now();
         QueuedMessage {
             id: Uuid::new_v4(),
-            from: "bob".into(),
+            from: mn("bob"),
             room,
             body: "hi".into(),
             enqueued_at: now,
@@ -1335,9 +1784,10 @@ mod diagnostic_tests {
         auth: AuthMethod,
         messages: Vec<QueuedMessage>,
     ) {
-        let inbox = app.register_session(session_token.to_string());
+        let session_token = SessionToken::from(session_token);
+        let inbox = app.register_session(session_token.clone());
         inbox.seed(messages).await;
-        app.register_room_membership(rt(room_token), member.into(), session_token, now, auth);
+        app.register_room_membership(rt(room_token), mn(member), &session_token, now, auth);
     }
 
     /// TDD 13.2/13.3/13.4/13.5: the snapshot includes every room, member, inbox
@@ -1398,20 +1848,14 @@ mod diagnostic_tests {
     async fn snapshot_groups_shared_inbox_once_per_session() {
         let mut app = AppState::default();
         let now = Instant::now();
-        let session = "shared-session-token";
+        let session = &SessionToken::from("shared-session-token");
 
-        let inbox = app.register_session(session.to_string());
+        let inbox = app.register_session(session.clone());
         inbox.seed(vec![msg(rt("rt-a")), msg(rt("rt-b"))]).await;
-        app.register_room_membership(
-            rt("rt-a"),
-            "alice".into(),
-            session,
-            now,
-            AuthMethod::RoomToken,
-        );
+        app.register_room_membership(rt("rt-a"), mn("alice"), session, now, AuthMethod::RoomToken);
         app.register_room_membership(
             rt("rt-b"),
-            "alice2".into(),
+            mn("alice2"),
             session,
             now,
             AuthMethod::RoomToken,
@@ -1440,16 +1884,10 @@ mod diagnostic_tests {
     async fn snapshot_flags_orphaned_receive_slot() {
         let mut app = AppState::default();
         let now = Instant::now();
-        let session = "sess-aaaa";
-        let inbox = app.register_session(session.to_string());
+        let session = &SessionToken::from("sess-aaaa");
+        let inbox = app.register_session(session.clone());
         inbox.claim_receive(); // active_gen set, but no receiver Arc clone exists
-        app.register_room_membership(
-            rt("rt"),
-            "alice".into(),
-            session,
-            now,
-            AuthMethod::RoomToken,
-        );
+        app.register_room_membership(rt("rt"), mn("alice"), session, now, AuthMethod::RoomToken);
         // Drop the constructor's own returned handle — only the structural
         // baseline (session_inboxes + this one MemberState) should remain, same
         // as no live parker holding an extra clone.
@@ -1477,7 +1915,7 @@ mod diagnostic_tests {
         let mut app = AppState::default();
         app.sessions.insert(
             "ghost-session".into(),
-            HashSet::from([(rt("rt"), "nobody".into())]),
+            HashSet::from([(rt("rt"), mn("nobody"))]),
         );
         app.session_inboxes
             .insert("ghost-session".into(), Inbox::new());
@@ -1503,19 +1941,13 @@ mod diagnostic_tests {
     async fn snapshot_flags_orphaned_parkers_without_active_slot() {
         let mut app = AppState::default();
         let now = Instant::now();
-        let session = "sess";
-        let inbox = app.register_session(session.to_string());
+        let session = &SessionToken::from("sess");
+        let inbox = app.register_session(session.clone());
         // Simulate orphaned frames holding extra Arc clones with no active slot and
         // no in-flight sender to explain them.
         let _orphan_a = inbox.clone();
         let _orphan_b = inbox.clone();
-        app.register_room_membership(
-            rt("rt"),
-            "alice".into(),
-            session,
-            now,
-            AuthMethod::RoomToken,
-        );
+        app.register_room_membership(rt("rt"), mn("alice"), session, now, AuthMethod::RoomToken);
         // Drop the constructor's own returned handle so only the two orphans
         // sit beyond the structural baseline (session_inboxes + MemberState).
         drop(inbox);
@@ -1544,19 +1976,13 @@ mod diagnostic_tests {
     async fn snapshot_does_not_flag_live_send_with_reply() {
         let mut app = AppState::default();
         let now = Instant::now();
-        let session = "sess";
-        let inbox = app.register_session(session.to_string());
+        let session = &SessionToken::from("sess");
+        let inbox = app.register_session(session.clone());
         // A live send-with-reply: extra clones AND a counted reply-waiter.
         let _sender_clone_a = inbox.clone();
         let _sender_clone_b = inbox.clone();
         let _guard = ReplyWaitGuard::new(inbox.clone());
-        app.register_room_membership(
-            rt("rt"),
-            "alice".into(),
-            session,
-            now,
-            AuthMethod::RoomToken,
-        );
+        app.register_room_membership(rt("rt"), mn("alice"), session, now, AuthMethod::RoomToken);
 
         let snap = app
             .diagnostic_snapshot(now, &names(&[("rt", "room")]), 1800, 0)
@@ -1582,15 +2008,9 @@ mod diagnostic_tests {
     async fn snapshot_seat_countdown_tracks_reaper() {
         let mut app = AppState::default();
         let now = Instant::now();
-        let session = "sess";
-        app.register_session(session.to_string());
-        app.register_room_membership(
-            rt("rt"),
-            "seatholder".into(),
-            session,
-            now,
-            AuthMethod::Seat,
-        );
+        let session = &SessionToken::from("sess");
+        app.register_session(session.clone());
+        app.register_room_membership(rt("rt"), mn("seatholder"), session, now, AuthMethod::Seat);
 
         // Reaper enabled (3600s) → seat shows a countdown (mortal), not exempt.
         let snap = app
@@ -1626,6 +2046,7 @@ mod diagnostic_tests {
 #[cfg(test)]
 mod eviction_tests {
     use super::*;
+    use crate::test_support::mn;
     use crate::tools::receive::{park_on_inbox, ParkOutcome};
 
     fn rt(s: &str) -> RoomToken {
@@ -1641,6 +2062,7 @@ mod eviction_tests {
                 inbox,
                 Instant::now() + Duration::from_secs(3600),
                 "alice",
+                usize::MAX,
                 |_| true,
             )
             .await
@@ -1670,18 +2092,18 @@ mod eviction_tests {
     #[tokio::test]
     async fn evict_member_aborts_in_flight_receive() {
         let mut app = AppState::default();
-        let inbox = app.register_session("sess".to_string());
+        let inbox = app.register_session("sess".into());
         let handle = park(inbox.clone()).await;
         app.register_room_membership(
             rt("rt"),
-            "alice".into(),
-            "sess",
+            mn("alice"),
+            &"sess".into(),
             Instant::now(),
             AuthMethod::RoomToken,
         );
 
         assert!(
-            app.evict_member("rt", "room", "alice", "kicked by operator")
+            app.evict_member("rt", "room", &mn("alice"), "kicked by operator")
                 .await
         );
         assert_aborted_promptly(handle).await;
@@ -1692,12 +2114,12 @@ mod eviction_tests {
     #[tokio::test]
     async fn evict_all_members_aborts_in_flight_receive() {
         let mut app = AppState::default();
-        let inbox = app.register_session("sess".to_string());
+        let inbox = app.register_session("sess".into());
         let handle = park(inbox.clone()).await;
         app.register_room_membership(
             rt("rt"),
-            "alice".into(),
-            "sess",
+            mn("alice"),
+            &"sess".into(),
             Instant::now(),
             AuthMethod::RoomToken,
         );
@@ -1712,17 +2134,18 @@ mod eviction_tests {
     #[tokio::test]
     async fn evict_member_superseded_aborts_in_flight_receive() {
         let mut app = AppState::default();
-        let inbox = app.register_session("sess".to_string());
+        let inbox = app.register_session("sess".into());
         let handle = park(inbox.clone()).await;
         app.register_room_membership(
             rt("rt"),
-            "alice".into(),
-            "sess",
+            mn("alice"),
+            &"sess".into(),
             Instant::now(),
             AuthMethod::RoomToken,
         );
 
-        app.evict_member_superseded("rt", "room", "alice").await;
+        app.evict_member_superseded("rt", "room", &mn("alice"))
+            .await;
         assert_aborted_promptly(handle).await;
     }
 
@@ -1733,37 +2156,37 @@ mod eviction_tests {
     #[tokio::test]
     async fn evict_one_room_leaves_other_room_and_shared_inbox_untouched() {
         let mut app = AppState::default();
-        let inbox = app.register_session("sess".to_string());
+        let inbox = app.register_session("sess".into());
         app.register_room_membership(
             rt("room-a"),
-            "alice".into(),
-            "sess",
+            mn("alice"),
+            &"sess".into(),
             Instant::now(),
             AuthMethod::RoomToken,
         );
         app.register_room_membership(
             rt("room-b"),
-            "alice2".into(),
-            "sess",
+            mn("alice2"),
+            &"sess".into(),
             Instant::now(),
             AuthMethod::RoomToken,
         );
 
         assert!(
-            app.evict_member("room-a", "room-a", "alice", "kicked")
+            app.evict_member("room-a", "room-a", &mn("alice"), "kicked")
                 .await
         );
 
         // The session survives via room-b.
-        assert!(app.session_exists("sess"));
+        assert!(app.session_exists(&"sess".into()));
         assert!(app
-            .session_memberships("sess")
+            .session_memberships(&"sess".into())
             .unwrap()
-            .contains(&(rt("room-b"), "alice2".to_string())));
+            .contains(&(rt("room-b"), mn("alice2"))));
         assert!(!app
-            .session_memberships("sess")
+            .session_memberships(&"sess".into())
             .unwrap()
-            .contains(&(rt("room-a"), "alice".to_string())));
+            .contains(&(rt("room-a"), mn("alice"))));
         // The shared inbox is untouched (not closed) — room-b's traffic still flows.
         assert!(!inbox.is_closed());
     }
@@ -1775,18 +2198,18 @@ mod eviction_tests {
     #[tokio::test]
     async fn evict_one_room_does_not_abort_receive_parked_on_surviving_room() {
         let mut app = AppState::default();
-        let inbox = app.register_session("sess".to_string());
+        let inbox = app.register_session("sess".into());
         app.register_room_membership(
             rt("room-a"),
-            "alice".into(),
-            "sess",
+            mn("alice"),
+            &"sess".into(),
             Instant::now(),
             AuthMethod::RoomToken,
         );
         app.register_room_membership(
             rt("room-b"),
-            "alice2".into(),
-            "sess",
+            mn("alice2"),
+            &"sess".into(),
             Instant::now(),
             AuthMethod::RoomToken,
         );
@@ -1800,6 +2223,7 @@ mod eviction_tests {
                     inbox,
                     Instant::now() + Duration::from_millis(200),
                     "alice",
+                    usize::MAX,
                     |_| true,
                 )
                 .await
@@ -1810,7 +2234,7 @@ mod eviction_tests {
         // Evict room-a — the room the parked receive's own member belongs to —
         // while room-b survives under the same session.
         assert!(
-            app.evict_member("room-a", "room-a", "alice", "kicked")
+            app.evict_member("room-a", "room-a", &mn("alice"), "kicked")
                 .await
         );
 
@@ -1834,13 +2258,13 @@ mod eviction_tests {
     #[tokio::test]
     async fn evict_one_room_discards_only_that_rooms_queued_messages() {
         let mut app = AppState::default();
-        let inbox = app.register_session("sess".to_string());
+        let inbox = app.register_session("sess".into());
         let now = Instant::now();
         inbox
             .seed(vec![
                 QueuedMessage {
                     id: Uuid::new_v4(),
-                    from: "bob".into(),
+                    from: mn("bob"),
                     room: rt("room-a"),
                     body: "for a".into(),
                     enqueued_at: now,
@@ -1849,7 +2273,7 @@ mod eviction_tests {
                 },
                 QueuedMessage {
                     id: Uuid::new_v4(),
-                    from: "bob".into(),
+                    from: mn("bob"),
                     room: rt("room-b"),
                     body: "for b".into(),
                     enqueued_at: now,
@@ -1860,21 +2284,21 @@ mod eviction_tests {
             .await;
         app.register_room_membership(
             rt("room-a"),
-            "alice".into(),
-            "sess",
+            mn("alice"),
+            &"sess".into(),
             now,
             AuthMethod::RoomToken,
         );
         app.register_room_membership(
             rt("room-b"),
-            "alice2".into(),
-            "sess",
+            mn("alice2"),
+            &"sess".into(),
             now,
             AuthMethod::RoomToken,
         );
 
         assert!(
-            app.evict_member("room-a", "room-a", "alice", "kicked")
+            app.evict_member("room-a", "room-a", &mn("alice"), "kicked")
                 .await
         );
 
@@ -1887,12 +2311,13 @@ mod eviction_tests {
 #[cfg(test)]
 mod inbox_close_tests {
     use super::*;
+    use crate::test_support::mn;
 
     fn msg() -> QueuedMessage {
         let now = Instant::now();
         QueuedMessage {
             id: Uuid::new_v4(),
-            from: "bob".into(),
+            from: mn("bob"),
             room: RoomToken::from("rt".to_string()),
             body: "hi".into(),
             enqueued_at: now,
@@ -1953,18 +2378,148 @@ mod inbox_close_tests {
     #[tokio::test]
     async fn evict_member_closes_inbox_when_last_membership() {
         let mut app = AppState::default();
-        let inbox = app.register_session("sess".to_string());
+        let inbox = app.register_session("sess".into());
         app.register_room_membership(
             RoomToken::from("rt".to_string()),
-            "alice".into(),
-            "sess",
+            mn("alice"),
+            &"sess".into(),
             Instant::now(),
             AuthMethod::RoomToken,
         );
 
         assert!(!inbox.is_closed());
-        assert!(app.evict_member("rt", "room", "alice", "kicked").await);
+        assert!(app.evict_member("rt", "room", &mn("alice"), "kicked").await);
         assert!(inbox.is_closed(), "eviction must close the member's inbox");
         assert_eq!(inbox.try_push(msg(), 100).await, PushOutcome::Closed);
+    }
+}
+
+#[cfg(test)]
+mod drain_cap_tests {
+    use super::*;
+    use crate::test_support::mn;
+
+    fn msg_at(room: &str, body: &str, ttl: Duration) -> QueuedMessage {
+        let now = Instant::now();
+        QueuedMessage {
+            id: Uuid::new_v4(),
+            from: mn("bob"),
+            room: RoomToken::from(room.to_string()),
+            body: body.into(),
+            enqueued_at: now,
+            expires_at: now + ttl,
+            reply_deadline: None,
+        }
+    }
+
+    fn bodies(d: &Drained) -> Vec<&str> {
+        d.messages.iter().map(|m| m.body.as_str()).collect()
+    }
+
+    async fn queued_bodies(inbox: &Inbox) -> Vec<String> {
+        inbox
+            .queue
+            .lock()
+            .await
+            .iter()
+            .map(|m| m.body.clone())
+            .collect()
+    }
+
+    const LIVE: Duration = Duration::from_secs(300);
+
+    #[tokio::test]
+    async fn capped_drain_takes_oldest_and_keeps_rest_in_order() {
+        let inbox = Inbox::new();
+        inbox
+            .seed(
+                (0..5)
+                    .map(|i| msg_at("a", &format!("m{i}"), LIVE))
+                    .collect(),
+            )
+            .await;
+        let d = inbox
+            .drain_valid_filtered_capped(Instant::now(), |_| true, 2)
+            .await;
+        assert_eq!(bodies(&d), ["m0", "m1"]);
+        assert_eq!(d.remaining, 3);
+        assert_eq!(queued_bodies(&inbox).await, ["m2", "m3", "m4"]);
+    }
+
+    #[tokio::test]
+    async fn capped_filtered_drain_counts_only_matching_and_preserves_interleave() {
+        let inbox = Inbox::new();
+        inbox
+            .seed(vec![
+                msg_at("b", "b0", LIVE),
+                msg_at("a", "a0", LIVE),
+                msg_at("a", "a1", LIVE),
+                msg_at("b", "b1", LIVE),
+                msg_at("a", "a2", LIVE),
+            ])
+            .await;
+        let a = RoomToken::from("a".to_string());
+        let d = inbox
+            .drain_valid_filtered_capped(Instant::now(), |r| r == &a, 1)
+            .await;
+        assert_eq!(bodies(&d), ["a0"]);
+        assert_eq!(d.remaining, 2, "non-matching room b is not counted");
+        assert_eq!(queued_bodies(&inbox).await, ["b0", "a1", "b1", "a2"]);
+    }
+
+    #[tokio::test]
+    async fn capped_drain_drops_expired_everywhere_and_excludes_them_from_remaining() {
+        let inbox = Inbox::new();
+        inbox
+            .seed(vec![
+                msg_at("a", "live0", LIVE),
+                msg_at("a", "dead", Duration::ZERO),
+                msg_at("a", "live1", LIVE),
+                msg_at("a", "live2", LIVE),
+            ])
+            .await;
+        let d = inbox
+            .drain_valid_filtered_capped(Instant::now(), |_| true, 1)
+            .await;
+        assert_eq!(bodies(&d), ["live0"]);
+        assert_eq!(d.remaining, 2);
+        assert_eq!(queued_bodies(&inbox).await, ["live1", "live2"]);
+    }
+
+    #[tokio::test]
+    async fn capped_drain_zero_limit_is_treated_as_one() {
+        let inbox = Inbox::new();
+        inbox
+            .seed(vec![msg_at("a", "x", LIVE), msg_at("a", "y", LIVE)])
+            .await;
+        let d = inbox
+            .drain_valid_filtered_capped(Instant::now(), |_| true, 0)
+            .await;
+        assert_eq!(bodies(&d), ["x"]);
+        assert_eq!(d.remaining, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_drain_returns_queued_remainder_immediately() {
+        let inbox = Inbox::new();
+        inbox
+            .seed(
+                (0..3)
+                    .map(|i| msg_at("a", &format!("m{i}"), LIVE))
+                    .collect(),
+            )
+            .await;
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        let first = inbox.wait_drain_until_filtered(deadline, |_| true, 2).await;
+        assert_eq!(bodies(&first), ["m0", "m1"]);
+        assert_eq!(first.remaining, 1);
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            inbox.wait_drain_until_filtered(deadline, |_| true, 2),
+        )
+        .await
+        .expect("a queued remainder must not block");
+        assert_eq!(bodies(&second), ["m2"]);
+        assert_eq!(second.remaining, 0);
     }
 }

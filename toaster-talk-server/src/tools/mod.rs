@@ -5,7 +5,7 @@ pub mod receive;
 pub mod roster;
 pub mod send;
 
-use crate::state::QueuedMessage;
+use crate::state::{MemberName, QueuedMessage};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -49,7 +49,7 @@ impl std::fmt::Display for Timeout {
 #[derive(Debug)]
 pub struct InboxMessage {
     pub id: Uuid,
-    pub from: String,
+    pub from: MemberName,
     /// Display name of the room this message was sent in. Every delivered message
     /// carries this because one session's shared inbox can hold traffic from
     /// several rooms at once — the recipient always knows where a message came
@@ -85,9 +85,17 @@ impl InboxMessage {
 }
 
 /// Return the first 8 bytes of a token string as a log-safe session ID.
-/// Uses `len().min(8)` so caller-supplied (potentially short/empty) tokens never panic.
-pub fn session_id(token: &str) -> &str {
-    &token[..token.len().min(8)]
+/// Uses `len().min(8)` so caller-supplied (potentially short/empty) tokens never
+/// panic, and backs off to a char boundary so a caller-supplied non-ASCII token
+/// cannot panic the slice either. Accepts a [`SessionToken`](crate::state::SessionToken)
+/// or any plain string.
+pub fn session_id<T: AsRef<str> + ?Sized>(token: &T) -> &str {
+    let token = token.as_ref();
+    let mut end = token.len().min(8);
+    while !token.is_char_boundary(end) {
+        end -= 1;
+    }
+    &token[..end]
 }
 
 /// Format a queued message's wait time as a human-readable age string.
@@ -130,58 +138,17 @@ fn format_duration(d: Duration) -> String {
     toaster_talk_common::format_duration_human(d)
 }
 
-/// Validate a member name against the allowed character set and length limit.
-/// Delegates to the shared predicate in the common crate (NEW-2).
-pub fn validate_member_name(name: &str) -> Result<(), crate::error::Error> {
-    if toaster_talk_common::is_valid_member_name(name) {
-        Ok(())
-    } else {
-        Err(crate::error::Error::InvalidMemberName(name.to_string()))
-    }
-}
-
 /// Generate a cryptographically random session token (32-byte hex string).
-pub fn new_session_token() -> String {
+pub fn new_session_token() -> crate::state::SessionToken {
     use uuid::Uuid;
     // Two UUIDs concatenated give 32 random bytes = 64 hex chars
-    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
-
-    // TDD 11.2: member name validation
-    #[test]
-    fn test_member_name_accepts_hyphen() {
-        assert!(validate_member_name("qa-agent").is_ok());
-        assert!(validate_member_name("dev_01").is_ok());
-    }
-
-    #[test]
-    fn test_member_name_rejects_space() {
-        assert!(matches!(
-            validate_member_name("my name"),
-            Err(Error::InvalidMemberName(_))
-        ));
-    }
-
-    #[test]
-    fn test_member_name_rejects_empty() {
-        assert!(matches!(
-            validate_member_name(""),
-            Err(Error::InvalidMemberName(_))
-        ));
-    }
-
-    #[test]
-    fn test_member_name_rejects_too_long() {
-        assert!(matches!(
-            validate_member_name(&"a".repeat(41)),
-            Err(Error::InvalidMemberName(_))
-        ));
-    }
+    use crate::test_support::mn;
 
     // Rubric 4.4 (wire shape): reply_expected_within_secs renders before `body` when
     // Some, and is omitted entirely when None. Placement matters — the `body` block
@@ -190,7 +157,7 @@ mod tests {
     fn test_format_messages_yaml_reply_expected_present_and_absent() {
         let with = InboxMessage {
             id: Uuid::nil(),
-            from: "alice".into(),
+            from: mn("alice"),
             room: "myroom".into(),
             body: "hi".into(),
             age: "1 second in queue".into(),
@@ -214,7 +181,7 @@ mod tests {
 
         let without = InboxMessage {
             id: Uuid::nil(),
-            from: "bob".into(),
+            from: mn("bob"),
             room: "myroom".into(),
             body: "yo".into(),
             age: "1 second in queue".into(),
@@ -235,7 +202,7 @@ mod tests {
         let now = Instant::now();
         let base = |deadline| QueuedMessage {
             id: Uuid::nil(),
-            from: "a".into(),
+            from: mn("a"),
             room: crate::rooms::RoomToken::from("rt".to_string()),
             body: "x".into(),
             enqueued_at: now,

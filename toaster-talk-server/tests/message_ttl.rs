@@ -57,7 +57,7 @@ async fn test_sweep_discards_expired_messages() {
     do_sweep(&app, &store, 1800, 0).await;
 
     // Alice's inbox must be empty after the sweep.
-    let result = handle_receive(&app, &store, alice, 0, None, None)
+    let result = handle_receive(&app, &store, alice, 0, None, None, usize::MAX)
         .await
         .unwrap();
     assert_eq!(result.timeout, Timeout::Elapsed);
@@ -110,7 +110,7 @@ async fn test_expired_message_filtered_at_receive() {
     }
 
     // Receive must filter the expired message without needing a sweep.
-    let result = handle_receive(&app, &store, alice, 0, None, None)
+    let result = handle_receive(&app, &store, alice, 0, None, None, usize::MAX)
         .await
         .unwrap();
     assert_eq!(result.timeout, Timeout::Elapsed);

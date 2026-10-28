@@ -10,7 +10,7 @@ This project uses Spec-Driven Development (SDD). Project documentation lives in 
 
 Read these files first:
 - `sdd/PRODUCT.md` — What this project is, why it exists, and the full vocabulary reference
-- `sdd/TDD.md` — Behavioural contract (118 rubrics across 15 functional areas). Read the table of contents first (~15 lines), then the sections relevant to your task.
+- `sdd/TDD.md` — Behavioural contract (131 rubrics across 15 functional areas). Read the table of contents first (~15 lines), then the sections relevant to your task.
 
 ### If you are contributing to this project — or building, running, or testing it
 
@@ -25,7 +25,7 @@ Read all of the above, plus:
 
 `connect` is a pure identity mint — it takes at most one optional input (`old_session_token`) and never sees a room token, seat token, or member name. It never creates a room membership, not even your first one. Call it once per agent process to obtain a `session_token`.
 
-Every room membership — including your very first room — is created by calling `join` with that `session_token` plus a room or seat token and your member name. To join additional rooms later, call `join` again, once per room; one session, one shared inbox, spans all of them. `send` now requires `room_name` (which room to send in) and `receive`'s optional `room` field lets you drain one room specifically or, omitted, everything queued across every room you've joined in one batch.
+Every room membership — including your very first room — is created by calling `join` with that `session_token` plus a room or seat token and your member name. To join additional rooms later, call `join` again, once per room; one session, one shared inbox, spans all of them. `send` now requires `room_name` (which room to send in) and `receive`'s optional `room` field lets you drain one room specifically or, omitted, messages from every room you've joined. Each `receive` returns at most a server-configured batch (`max_receive_batch`, default 16), oldest first; a non-zero `remaining` field in the response means more is still queued — call `receive` again (it returns immediately, without waiting) until `remaining` is 0. Nothing past the batch is lost or reordered. A send-with-reply's reply drain is capped the same way and reports `remaining` too.
 
 `join` never silently mints a session: a missing or invalid `session_token` is a hard error, not an implicit `connect`. `MemberNameTaken` (room-token collision with a different session) is a **fatal, non-retryable error** — do not append a suffix or invent a new name, and do not retry `join` with a different name; surface it to the operator instead. Joining a room your own session already belongs to is also rejected (not a silent no-op) — do not re-`join` a room you already hold.
 
@@ -37,5 +37,5 @@ Because `session_token` now grants access to every room your session belongs to 
 
 ### Additional documents (read when relevant)
 
-- `sdd/ISSUES.md` — Known unresolved issues (10 open). Read the table of contents first, then only the entries bearing on your task; consult it when investigating unexpected behaviour or before touching transport, auth, or receive.
+- `sdd/ISSUES.md` — Known unresolved issues (1 open). Read the table of contents first, then only the entries bearing on your task; consult it when investigating unexpected behaviour or before touching transport, auth, or receive.
 - `sdd/PLAN.broadcast.md` — Deferred design for broadcast and multi-consumer rooms. Read before adding any fanout or multi-recipient capability.

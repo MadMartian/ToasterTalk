@@ -13,6 +13,8 @@
 //!   test_kckm_removes_multiple_members     → TDD 10.8
 //!   test_kckall_removes_all_members        → TDD 10.9
 //!   test_addrm_addmb_batch_*, test_delrm_delmb_kckall_batch_* → TDD 10.23–10.25
+//!   test_addrm_existing_room_*, test_addrm_batch_existing_* → TDD 10.26
+//!   test_addrm_force_overwrites_and_drops_seats → TDD 10.27
 
 mod common;
 
@@ -481,9 +483,14 @@ async fn test_addrm_addmb_batch_create_and_reuse_identical_token_files() {
         "identical seat files must be reused, not duplicated"
     );
 
-    // Re-adding existing rooms re-derives the same deterministic token, so the
-    // identical room token files must be reused too.
-    let out = run_cli(&socket_path, &token_dir, &["addrm", "r-one", "r-two"]).await;
+    // Force-overwriting existing rooms re-derives the same deterministic token,
+    // so the identical room token files must be reused too.
+    let out = run_cli(
+        &socket_path,
+        &token_dir,
+        &["addrm", "--force", "r-one", "r-two"],
+    )
+    .await;
     assert!(out.status.success());
     assert!(!token_dir.join("r-one_1.tok").exists());
     assert!(!token_dir.join("r-two_1.tok").exists());
@@ -564,4 +571,137 @@ async fn test_file_flag_rejected_for_multiple_names() {
     .await;
     assert!(!out.status.success());
     assert!(store.read().await.get_by_name("x").is_none());
+}
+
+// ── addrm on an existing room ─────────────────────────────────────────────────
+
+/// Rubric 10.26: without `--force` and with no terminal on stdin, `addrm` of an
+/// existing room is refused with a non-zero exit and leaves the room — its
+/// seats and its timestamps — exactly as it was.
+#[tokio::test]
+async fn test_addrm_existing_room_refused_without_force_non_tty() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir);
+    let app = AppState::new();
+    let socket_path = common::test_mgmt_addr(&dir);
+    let token_dir = dir.path().join("tokens");
+    spawn_mgmt(&socket_path, &store, &app).await;
+
+    let out = run_cli(&socket_path, &token_dir, &["addrm", "keep-me"]).await;
+    assert!(out.status.success());
+    let out = run_cli(&socket_path, &token_dir, &["addmb", "keep-me", "alice"]).await;
+    assert!(out.status.success());
+    let before = store.read().await.get_by_name("keep-me").unwrap().clone();
+    assert_eq!(before.seats.len(), 1);
+
+    let out = run_cli(
+        &socket_path,
+        &token_dir,
+        &["addrm", "keep-me", "--ttl", "1"],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "addrm of an existing room without --force must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("keep-me") && stderr.contains("--force"),
+        "refusal must name the room and the way to overwrite: {stderr}"
+    );
+
+    let after = store.read().await.get_by_name("keep-me").unwrap().clone();
+    assert_eq!(after.seats.len(), 1, "seats must survive a refused addrm");
+    assert_eq!(after.created_at_secs, before.created_at_secs);
+    assert_eq!(after.expires_at_secs, before.expires_at_secs);
+}
+
+/// Rubric 10.26/10.23: in a batch, an existing room is refused on its own while
+/// the new names are still created, and a name repeated within the one command
+/// is processed once (never created and then silently replaced by its repeat).
+#[tokio::test]
+async fn test_addrm_batch_existing_room_skipped_others_created() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir);
+    let app = AppState::new();
+    let socket_path = common::test_mgmt_addr(&dir);
+    let token_dir = dir.path().join("tokens");
+    spawn_mgmt(&socket_path, &store, &app).await;
+
+    run_cli(&socket_path, &token_dir, &["addrm", "old"]).await;
+    run_cli(&socket_path, &token_dir, &["addmb", "old", "alice"]).await;
+
+    let out = run_cli(
+        &socket_path,
+        &token_dir,
+        &["addrm", "fresh", "old", "fresh"],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "a refused existing room must make the batch exit non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches("Room created.").count(),
+        1,
+        "the repeated new name is created exactly once: {stdout}"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("'old' already exists"));
+    assert!(store.read().await.get_by_name("fresh").is_some());
+    assert_eq!(
+        store.read().await.get_by_name("old").unwrap().seats.len(),
+        1,
+        "the existing room in the batch must keep its seats"
+    );
+    assert!(!token_dir.join("fresh_1.tok").exists());
+}
+
+/// Rubric 10.27: `addrm --force` on an existing room overwrites it — the room
+/// token is unchanged, but its seats are dropped, its expiry is reset, and its
+/// connected members are evicted.
+#[tokio::test]
+async fn test_addrm_force_overwrites_and_drops_seats() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir);
+    let app = AppState::new();
+    let socket_path = common::test_mgmt_addr(&dir);
+    let token_dir = dir.path().join("tokens");
+    spawn_mgmt(&socket_path, &store, &app).await;
+
+    run_cli(&socket_path, &token_dir, &["addrm", "redo"]).await;
+    run_cli(&socket_path, &token_dir, &["addmb", "redo", "alice"]).await;
+    let before = store.read().await.get_by_name("redo").unwrap().clone();
+    assert_eq!(before.seats.len(), 1);
+
+    let bob_session = handle_connect(&app, None).await.unwrap().session_token;
+    handle_join_room_token(
+        &app,
+        &store,
+        bob_session.clone(),
+        before.token.to_string(),
+        "bob".into(),
+    )
+    .await
+    .unwrap();
+
+    let out = run_cli(
+        &socket_path,
+        &token_dir,
+        &["addrm", "-f", "redo", "--ttl", "1"],
+    )
+    .await;
+    assert!(out.status.success(), "addrm --force must exit 0");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("overwritten"));
+
+    let after = store.read().await.get_by_name("redo").unwrap().clone();
+    assert_eq!(after.token, before.token, "room token is name-derived");
+    assert!(after.seats.is_empty(), "overwrite must drop all seats");
+    assert!(after.expires_at_secs < before.expires_at_secs);
+    assert!(
+        !app.read().await.sessions.contains_key(&bob_session),
+        "a member of the overwritten room must be evicted"
+    );
+    // The room token file is identical (same token), so it is reused.
+    assert!(!token_dir.join("redo_1.tok").exists());
 }

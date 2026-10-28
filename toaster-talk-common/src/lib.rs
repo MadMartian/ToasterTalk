@@ -69,9 +69,8 @@ pub fn sanitize_filename(name: &str) -> String {
 /// Returns true iff `name` is a valid member name: non-empty, ≤40 chars, and
 /// composed only of ASCII alphanumerics plus `_` and `-`.
 ///
-/// Lives in the common crate so both `toaster-talk-server::tools::validate_member_name`
-/// and `toaster-talk-server::rooms::create_seat` can share one definition without
-/// the rooms ← tools ← state ← rooms dependency cycle.
+/// The single definition of the member-name rules; the server's validating
+/// `MemberName::new` constructor wraps it.
 pub fn is_valid_member_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 40

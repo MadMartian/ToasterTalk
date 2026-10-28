@@ -25,11 +25,21 @@ pub fn test_config() -> Config {
         idle_threshold_secs: 300,
         member_idle_ttl_secs: 1800,
         seat_idle_ttl_secs: 0, // reaper disabled in unit tests unless a test opts in
+        seat_flap_threshold: 3,
+        seat_flap_window_secs: 30,
+        seat_flap_hold_down_secs: 60,
         default_receive_timeout_secs: 30,
         max_await_reply_secs: 3600,
         max_receive_timeout_secs: 3600,
         max_inbox_messages: 100,
+        max_receive_batch: 16,
         mgmt_socket: PathBuf::from("/tmp/mgmt.sock"),
         master_secret: MasterSecret::new(TEST_MASTER_SECRET),
     }
+}
+
+/// Build a [`MemberName`](crate::state::MemberName) from a known-valid test
+/// literal. Panics on an invalid name — test fixtures only.
+pub fn mn(name: &str) -> crate::state::MemberName {
+    crate::state::MemberName::new(name).expect("test member name must be valid")
 }

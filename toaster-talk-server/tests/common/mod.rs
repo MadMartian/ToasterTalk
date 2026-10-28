@@ -34,10 +34,14 @@ pub fn test_config() -> Config {
         idle_threshold_secs: 300,
         member_idle_ttl_secs: 1800,
         seat_idle_ttl_secs: 0, // reaper disabled by default in integration tests
+        seat_flap_threshold: 3,
+        seat_flap_window_secs: 30,
+        seat_flap_hold_down_secs: 60,
         default_receive_timeout_secs: 30,
         max_await_reply_secs: 3600,
         max_receive_timeout_secs: 3600,
         max_inbox_messages: 100,
+        max_receive_batch: 16,
         mgmt_socket: PathBuf::from("/tmp/mgmt-test.sock"),
         master_secret: MasterSecret::new(TEST_MASTER_SECRET),
     }
@@ -74,7 +78,7 @@ pub async fn join(
     store: &Arc<RwLock<RoomStore>>,
     room_token: &str,
     member: &str,
-) -> String {
+) -> toaster_talk_server::state::SessionToken {
     let session_token = handle_connect(app, None).await.unwrap().session_token;
     handle_join_room_token(
         app,

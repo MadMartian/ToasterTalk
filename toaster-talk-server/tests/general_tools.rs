@@ -39,7 +39,7 @@ async fn test_delivered_message_includes_age() {
     .await
     .unwrap();
 
-    let result = handle_receive(&app, &store, alice, 1, None, None)
+    let result = handle_receive(&app, &store, alice, 1, None, None, usize::MAX)
         .await
         .unwrap();
     assert_eq!(result.timeout, Timeout::None);

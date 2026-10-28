@@ -3,20 +3,20 @@
 | # | Functional area | Rubrics     |
 |---|---|-------------|
 | 1a | Connect | 1a.1 – 1a.5   |
-| 1b | Join | 1b.1 – 1b.7   |
+| 1b | Join | 1b.1 – 1b.8   |
 | 1c | Leave | 1c.1 – 1c.6   |
 | 2 | Send (Fire and Forget) | 2.1 – 2.6   |
-| 3 | Receive | 3.1 – 3.10   |
-| 4 | Send-with-reply | 4.1 – 4.4   |
+| 3 | Receive | 3.1 – 3.13   |
+| 4 | Send-with-reply | 4.1 – 4.5   |
 | 5 | General Tools | 5.1 – 5.3   |
 | 6 | Message TTL | 6.1 – 6.3   |
 | 7 | Auth and isolation | 7.1 – 7.2   |
-| 8 | Configuration | 8.1 – 8.17  |
+| 8 | Configuration | 8.1 – 8.20  |
 | 9 | Error handling | 9.1 – 9.7   |
-| 10 | Room Management & Member Lifecycle | 10.1 – 10.25, 10.10b, 10.13b |
+| 10 | Room Management & Member Lifecycle | 10.1 – 10.27, 10.10b, 10.13b |
 | 11 | Room & Member Name Validation | 11.1, 11.1b, 11.2, 11.3 |
-| 12 | Seat Tokens | 12.1 – 12.5 |
-| 13 | Diagnostics | 13.1 – 13.12 |
+| 12 | Seat Tokens | 12.1 – 12.7 |
+| 13 | Diagnostics | 13.1 – 13.13 |
 
 ---
 
@@ -95,6 +95,13 @@
 - **Given** the agent has joined a room and has a valid session token
 - **When** the agent attempts to join that same room again, with a valid session token
 - **Then** the MCP server returns an error message indicating that the agent has already joined that room
+
+### 1b.8
+- **Given** an agent's `join` (room token or seat token) has verified its credential
+- **When** the operator deletes that room (or, for a seat join, that seat) at the same moment
+- **Then** either the join is rejected exactly as a join against the already-deleted credential would be, or the join
+  completes first and the deletion then evicts the new membership — a membership is never left attached to a room or
+  seat that no longer exists
 
 ---
 
@@ -179,7 +186,7 @@
 - **Then** the tool will return immediately indicating no message was received
 
 ### 3.3
-- **Given** multiple messages are waiting
+- **Given** multiple messages are waiting, no more than the configured per-call batch size (`max_receive_batch`)
 - **When** the member invokes a tool to receive messages
 - **Then** all enqueued messages will be returned in the order they were enqueued
 
@@ -210,12 +217,34 @@
 ### 3.9
 - **Given** messages are waiting for an agent in more than one room
 - **When** an agent specifies to `receive` messages without specifying any room at all from which to receive them
-- **Then** the MCP server will return all messages in the inbox coming from any room that that agent has joined
+- **Then** the MCP server will return the messages in the inbox coming from any room that that agent has joined
+  (up to the per-call batch size — see 3.11)
 
 ### 3.10
 - **Given** multiple messages from different rooms are waiting in an agent's inbox
 - **When** the agent calls `receive` to receive all of them, without specifying a specific room from which to receive them
 - **Then** each message in the response indicates the room and member of that room from which the message came
+
+### 3.11
+- **Given** more messages are waiting for a member than the configured per-call batch size (`max_receive_batch`,
+  default 16)
+- **When** the member calls `receive`
+- **Then** the response contains exactly the batch size of the oldest waiting messages, in enqueue order
+- **And** the response's `remaining` field reports how many further messages are still queued, so the agent knows to
+  call `receive` again; a response that emptied the inbox (or returned nothing) reports `remaining: 0`
+
+### 3.12
+- **Given** a previous `receive` returned a capped batch and reported a non-zero `remaining`
+- **When** the member calls `receive` again, even with a long `timeout_secs`
+- **Then** the call returns immediately (without waiting) with the next batch, continuing in enqueue order
+- **And** across successive calls every queued message is delivered exactly once — none is lost or reordered by the cap
+
+### 3.13
+- **Given** a member's inbox holds messages from several rooms, and more from one room than the batch size
+- **When** the member calls `receive` naming that room
+- **Then** the batch cap applies to that room's messages only: up to the batch size of that room's oldest messages are
+  returned, `remaining` counts only that room's leftover messages, and other rooms' messages stay queued, in their
+  original order, for a later call
 
 ---
 
@@ -245,6 +274,14 @@ This section implies rubrics from section 3 (Receive) and rubrics 2.4-2.6 from s
 - **Then** the delivered message carries a `reply_expected_within_secs` field giving the seconds remaining in the
   sender's reply window as of delivery (counting down as the message sits queued); a fire-and-forget message
   (no `await_reply_secs`) carries no such field
+
+### 4.5
+- **Given** more messages from the target room are waiting in the sender's inbox than the per-call batch size
+- **When** the sender's send-with-reply wait drains them
+- **Then** it returns at most the batch size of them, oldest first — the same cap `receive` applies — and reports the
+  rest in `remaining`
+- **And** the messages past the cap (which may include the awaited reply) stay queued in order and are delivered by
+  the sender's next `receive` — a reply is never discarded by the cap
 
 ---
 
@@ -394,6 +431,27 @@ This section implies rubrics from section 3 (Receive) and rubrics 2.4-2.6 from s
 - **When** they issue an explicit reload command through the management interface
 - **Then** the change takes effect exactly as it does for any other reload trigger (per 8.13–8.16) — reload does not
   depend on an out-of-band signal being available
+
+### 8.18
+- **Given** the operator sets the per-call receive batch size (`max_receive_batch`) in the config file, an environment
+  variable, both, or neither
+- **When** the server starts or reloads
+- **Then** the environment variable overrides the config file, the config file overrides the default, and the default
+  is 16 — and the resolved value is the cap every `receive` and send-with-reply drain applies
+
+### 8.19
+- **Given** the operator sets `max_receive_batch` to `0` or to more than `1000`
+- **When** the server starts (or a reload is processed)
+- **Then** the configuration is rejected with an error naming `max_receive_batch` (startup fails; a reload keeps the
+  running configuration) — a value above `max_inbox_messages` is accepted, as it is simply never reached
+
+### 8.20
+- **Given** the operator sets the seat-contention detection knobs (supersession threshold, counting window, freeze
+  hold-down) in the config file and/or environment
+- **When** the configuration is resolved
+- **Then** each knob follows the usual file → environment precedence and defaults to a threshold of 3, a 30 s window
+  and a 60 s hold-down when unset; a threshold of 0 disables detection, and a value outside its documented bounds is
+  refused with a configuration error rather than clamped
 
 ---
 
@@ -576,6 +634,20 @@ This section implies rubrics from section 3 (Receive) and rubrics 2.4-2.6 from s
 - **When** the command runs
 - **Then** the items that can succeed are applied, each failed item is reported with its name, and the CLI exits non-zero because at least one item failed
 
+### 10.26
+- **Given** a room already exists (with or without seats and connected members)
+- **When** the operator runs `addrm` naming it — alone or in a batch, and without `-f`/`--force`
+- **Then** the room is never silently replaced: its seats, seat token files, timestamps and members are left exactly as they were
+- **And** at an interactive terminal the CLI asks, per existing room, whether to overwrite it (dropping all its seats), defaulting to No; a declined room is skipped and reported, the rest of the batch still proceeds, and the CLI exits non-zero because that room was not (re)created
+- **And** without an interactive terminal the CLI does not prompt: it reports each existing room as an error naming `--force` and exits non-zero, while any new names in the same batch are still created
+- **And** a name repeated within one `addrm` command is processed once, so a repeat can never replace the room its first occurrence just created
+
+### 10.27
+- **Given** a room already exists with seats and connected members
+- **When** the operator runs `addrm --force` (or `-f`) naming it, or confirms the overwrite at the prompt
+- **Then** the room is replaced: its room token is unchanged (and its token file reused), but all of its seats are dropped so their seat tokens no longer authenticate, its created and expiry timestamps are reset to the new TTL, and its connected members are evicted
+- **And** the CLI reports the room as overwritten rather than created
+
 ## 11. Room & Member Name Validation
 
 ### 11.1
@@ -626,6 +698,22 @@ This section implies rubrics from section 3 (Receive) and rubrics 2.4-2.6 from s
 - **When** the seat token file is written to disk
 - **Then** it is placed at `tokens/user/<room>/<member>.tok` — the room name as a subdirectory and the member name as the filename (both filesystem-sanitised), mode `0600`
 - **And** if that path already exists, an incrementing numeric suffix (`_1`, `_2`, …) is appended within the same room subdirectory rather than overwriting
+
+### 12.6
+- **Given** two live agents hold the same seat token and keep joining with it, superseding each other
+- **When** the seat is superseded more than the configured threshold of times within the configured window
+- **Then** the server logs a warning naming the room and member as possible seat credential contention (never any
+  token), and freezes the seat for the configured hold-down
+- **And** while frozen, a seat-token join that would supersede the current holder is rejected with a distinct
+  `SeatContention` error stating how long the freeze lasts, and the current holder keeps its membership — the
+  ping-pong ends with one winner
+- **And** a frozen seat that currently has no holder can still be claimed
+
+### 12.7
+- **Given** a seat is frozen for credential contention
+- **When** the hold-down lapses, or the operator kicks that member (`kckm`), kicks the whole room (`kckall`), or
+  deletes the seat (`delmb`)
+- **Then** the freeze and its supersession history are cleared, and the next superseding seat-token join is accepted
 
 ## 13. Diagnostics
 
@@ -715,4 +803,11 @@ receive without restarting the server or kicking members.
 - **When** the diagnostic dump is produced
 - **Then** every session's entry — roomless or not — shows how long ago it was connected, so an operator can tell a
   session that is merely mid-handshake (`memberships: []`, connected moments ago) from one that is genuinely stuck
+
+### 13.13
+- **Given** a seat member whose seat has been superseded (possibly enough to freeze it)
+- **When** the diagnostic dump is produced
+- **Then** that member's row shows the number of recent supersessions inside the detection window, how long ago the
+  last one happened (or that there has been none), and whether the seat is frozen and for how much longer — so
+  credential contention is visible without reading the journal, and no token appears in the output
   (`memberships: []`, connected far longer than a `connect`→`join` round-trip should ever take)

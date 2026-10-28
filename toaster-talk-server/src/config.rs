@@ -44,11 +44,32 @@ const DEFAULT_RECEIVE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_AWAIT_REPLY_SECS: u64 = 3600;
 const DEFAULT_MAX_RECEIVE_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_MAX_INBOX_MESSAGES: usize = 100;
+/// Default cap on messages returned by one `receive` (or one send-with-reply
+/// reply drain). Small enough that a flooded inbox cannot produce an oversized
+/// response; the remainder stays queued for the next call.
+pub const DEFAULT_MAX_RECEIVE_BATCH: usize = 16;
+/// Hard upper bound on `max_receive_batch`. A fixed bound rather than
+/// `max_inbox_messages`, so lowering the inbox cap never invalidates an otherwise
+/// valid batch setting (the batch is naturally bounded by the inbox size anyway).
+pub const MAX_MAX_RECEIVE_BATCH: usize = 1000;
 /// Default dead-seat reaper threshold: 24 h. A seat idle this long **with no active
 /// receive** is reaped so its inbox stops black-holing messages (ANTI-PATTERNS #10).
 /// Generous by design — seats are the privileged, persistent tier — but bounded so a
 /// crashed seat can't linger forever. `0` disables the reaper (seats fully exempt).
 const DEFAULT_SEAT_IDLE_TTL_SECS: u64 = 86_400;
+
+/// Seat-contention flap detection defaults. Two live agents holding one seat
+/// credential supersede each other on every `join`, ping-ponging forever; counting
+/// supersessions per seat inside a sliding window turns that silent livelock into a
+/// WARN plus a temporary freeze that leaves one holder in place. A seat is frozen
+/// once it has been superseded MORE than `threshold` times within `window` seconds,
+/// and stays frozen for `hold_down` seconds. `threshold == 0` disables detection.
+const DEFAULT_SEAT_FLAP_THRESHOLD: u32 = 3;
+const DEFAULT_SEAT_FLAP_WINDOW_SECS: u64 = 30;
+const DEFAULT_SEAT_FLAP_HOLD_DOWN_SECS: u64 = 60;
+const MAX_SEAT_FLAP_THRESHOLD: u32 = 1_000;
+const MAX_SEAT_FLAP_WINDOW_SECS: u64 = 3_600; // 1 hour
+const MAX_SEAT_FLAP_HOLD_DOWN_SECS: u64 = 86_400; // 24 hours
 
 /// Bounds on `member_idle_ttl_secs` (the non-seat member idle TTL). There is **no**
 /// default: the operator must choose a value inside this range or the server
@@ -91,6 +112,15 @@ pub struct Config {
     /// active receive is ever eligible. Operator-only; agents have no wire path to
     /// it. See ANTI-PATTERNS.md #10.
     pub seat_idle_ttl_secs: u64,
+    /// Seat-contention flap detection: a seat superseded more than this many times
+    /// within `seat_flap_window_secs` is frozen (further superseding seat-token
+    /// joins rejected with `SeatContention`) for `seat_flap_hold_down_secs`. `0`
+    /// disables detection. Bounded to `0..=1000`.
+    pub seat_flap_threshold: u32,
+    /// Sliding window over which seat supersessions are counted. `1..=3600`.
+    pub seat_flap_window_secs: u64,
+    /// How long a contended seat stays frozen once the threshold trips. `1..=86400`.
+    pub seat_flap_hold_down_secs: u64,
     pub default_receive_timeout_secs: u64,
     /// Hard ceiling on `await_reply_secs` in `send` — applied server-side regardless of transport.
     pub max_await_reply_secs: u64,
@@ -99,6 +129,11 @@ pub struct Config {
     /// Maximum number of messages a single member's inbox may hold at once.
     /// Sends that would exceed this limit are rejected with InboxFull.
     pub max_inbox_messages: usize,
+    /// Maximum number of messages one `receive` call (or one send-with-reply
+    /// reply drain) returns. Further queued messages stay in the inbox, in order,
+    /// and the response reports how many remain. Bounded to
+    /// `1..=MAX_MAX_RECEIVE_BATCH`; default [`DEFAULT_MAX_RECEIVE_BATCH`].
+    pub max_receive_batch: usize,
     pub mgmt_socket: PathBuf,
     /// Master secret used for HMAC-SHA256 token derivation. Loaded from file at startup;
     /// never logged, never written to rooms.yaml.
@@ -125,6 +160,9 @@ struct FileRoomsConfig {
     max_rooms: Option<usize>,
     default_ttl_days: Option<u64>,
     max_ttl_days: Option<u64>,
+    seat_flap_threshold: Option<u32>,
+    seat_flap_window_secs: Option<u64>,
+    seat_flap_hold_down_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -139,6 +177,7 @@ struct FileMessagesConfig {
     max_await_reply_secs: Option<u64>,
     max_receive_timeout_secs: Option<u64>,
     max_inbox_messages: Option<usize>,
+    max_receive_batch: Option<usize>,
 }
 
 // ── CLI args ─────────────────────────────────────────────────────────────────
@@ -384,6 +423,12 @@ impl Config {
             env_parse::<usize>("TOASTER_MAX_INBOX_MESSAGES")?,
             None,
         );
+        let max_receive_batch = layer(
+            DEFAULT_MAX_RECEIVE_BATCH,
+            fm.max_receive_batch,
+            env_parse::<usize>("TOASTER_MAX_RECEIVE_BATCH")?,
+            None,
+        );
         let mgmt_socket = layer(
             default_mgmt_socket(),
             file.mgmt_socket.as_deref().map(expand),
@@ -448,11 +493,53 @@ impl Config {
             None,
         );
 
+        let seat_flap_threshold = layer(
+            DEFAULT_SEAT_FLAP_THRESHOLD,
+            fr.seat_flap_threshold,
+            env_parse::<u32>("TOASTER_SEAT_FLAP_THRESHOLD")?,
+            None,
+        );
+        let seat_flap_window_secs = layer(
+            DEFAULT_SEAT_FLAP_WINDOW_SECS,
+            fr.seat_flap_window_secs,
+            env_parse::<u64>("TOASTER_SEAT_FLAP_WINDOW_SECS")?,
+            None,
+        );
+        let seat_flap_hold_down_secs = layer(
+            DEFAULT_SEAT_FLAP_HOLD_DOWN_SECS,
+            fr.seat_flap_hold_down_secs,
+            env_parse::<u64>("TOASTER_SEAT_FLAP_HOLD_DOWN_SECS")?,
+            None,
+        );
+
         // Validate consistency
+        if seat_flap_threshold > MAX_SEAT_FLAP_THRESHOLD {
+            return Err(Error::Config(format!(
+                "seat_flap_threshold ({seat_flap_threshold}) must be between 0 (disabled) \
+                 and {MAX_SEAT_FLAP_THRESHOLD}"
+            )));
+        }
+        if !(1..=MAX_SEAT_FLAP_WINDOW_SECS).contains(&seat_flap_window_secs) {
+            return Err(Error::Config(format!(
+                "seat_flap_window_secs ({seat_flap_window_secs}) must be between 1 and \
+                 {MAX_SEAT_FLAP_WINDOW_SECS}"
+            )));
+        }
+        if !(1..=MAX_SEAT_FLAP_HOLD_DOWN_SECS).contains(&seat_flap_hold_down_secs) {
+            return Err(Error::Config(format!(
+                "seat_flap_hold_down_secs ({seat_flap_hold_down_secs}) must be between 1 and \
+                 {MAX_SEAT_FLAP_HOLD_DOWN_SECS}"
+            )));
+        }
         if max_inbox_messages == 0 {
             return Err(Error::Config(
                 "max_inbox_messages must be at least 1".into(),
             ));
+        }
+        if !(1..=MAX_MAX_RECEIVE_BATCH).contains(&max_receive_batch) {
+            return Err(Error::Config(format!(
+                "max_receive_batch ({max_receive_batch}) must be between 1 and {MAX_MAX_RECEIVE_BATCH}"
+            )));
         }
         if !(MIN_MEMBER_IDLE_TTL_SECS..=MAX_MEMBER_IDLE_TTL_SECS).contains(&member_idle_ttl_secs) {
             return Err(Error::Config(format!(
@@ -494,10 +581,14 @@ impl Config {
             idle_threshold_secs,
             member_idle_ttl_secs,
             seat_idle_ttl_secs,
+            seat_flap_threshold,
+            seat_flap_window_secs,
+            seat_flap_hold_down_secs,
             default_receive_timeout_secs,
             max_await_reply_secs,
             max_receive_timeout_secs,
             max_inbox_messages,
+            max_receive_batch,
             mgmt_socket,
             master_secret,
         };
@@ -508,8 +599,13 @@ impl Config {
             max_rooms = cfg.max_rooms,
             default_room_ttl_days = cfg.default_room_ttl_days,
             default_message_ttl_secs = cfg.default_message_ttl_secs,
+            max_inbox_messages = cfg.max_inbox_messages,
+            max_receive_batch = cfg.max_receive_batch,
             store_path = %cfg.store_path.display(),
             mgmt_socket = %cfg.mgmt_socket.display(),
+            seat_flap_threshold = cfg.seat_flap_threshold,
+            seat_flap_window_secs = cfg.seat_flap_window_secs,
+            seat_flap_hold_down_secs = cfg.seat_flap_hold_down_secs,
             "config resolved"
         );
 
@@ -916,5 +1012,184 @@ mod tests {
         std::env::remove_var("TOASTER_MEMBER_IDLE_TTL_SECS");
         std::env::remove_var("TOASTER_IDLE_THRESHOLD_SECS");
         assert!(result.is_err());
+    }
+
+    // ── max_receive_batch (per-call receive cap) ──────────────────────────────
+
+    /// Helper: load with the mandatory keys present, an optional config-file body,
+    /// and a specific (or absent) TOASTER_MAX_RECEIVE_BATCH env value.
+    fn load_with_receive_batch(
+        file_body: Option<&str>,
+        env: Option<&str>,
+    ) -> Result<Config, Error> {
+        set_test_secret();
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        if let Some(body) = file_body {
+            std::fs::write(&config_path, body).unwrap();
+        }
+        match env {
+            Some(v) => std::env::set_var("TOASTER_MAX_RECEIVE_BATCH", v),
+            None => std::env::remove_var("TOASTER_MAX_RECEIVE_BATCH"),
+        }
+        let args = CliArgs {
+            config: Some(config_path),
+            bind: None,
+            port: None,
+            log_level: None,
+        };
+        let result = Config::load(&args);
+        std::env::remove_var("TOASTER_MAX_RECEIVE_BATCH");
+        clear_test_secret();
+        result
+    }
+
+    #[test]
+    fn test_max_receive_batch_defaults_to_16() {
+        // Rubric 8.18: unset → 16.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = load_with_receive_batch(None, None).unwrap();
+        assert_eq!(cfg.max_receive_batch, DEFAULT_MAX_RECEIVE_BATCH);
+        assert_eq!(cfg.max_receive_batch, 16);
+    }
+
+    #[test]
+    fn test_max_receive_batch_file_then_env_precedence() {
+        // Rubric 8.18: [messages].max_receive_batch is honoured, and the env var
+        // overrides it.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let body = "[messages]\nmax_receive_batch = 8\n";
+        let cfg = load_with_receive_batch(Some(body), None).unwrap();
+        assert_eq!(cfg.max_receive_batch, 8, "file layer");
+        let cfg = load_with_receive_batch(Some(body), Some("32")).unwrap();
+        assert_eq!(cfg.max_receive_batch, 32, "env overrides file");
+        let cfg = load_with_receive_batch(None, Some("4")).unwrap();
+        assert_eq!(cfg.max_receive_batch, 4, "env overrides default");
+    }
+
+    #[test]
+    fn test_max_receive_batch_bounds() {
+        // Rubric 8.19: 1..=1000 accepted; 0 or > 1000 is a fatal config error that
+        // names the key. Independent of max_inbox_messages.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            load_with_receive_batch(None, Some("1"))
+                .unwrap()
+                .max_receive_batch,
+            1
+        );
+        assert_eq!(
+            load_with_receive_batch(None, Some("1000"))
+                .unwrap()
+                .max_receive_batch,
+            MAX_MAX_RECEIVE_BATCH
+        );
+        for bad in ["0", "1001"] {
+            let err = load_with_receive_batch(None, Some(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("max_receive_batch"), "got: {err}");
+        }
+        let err = load_with_receive_batch(Some("[messages]\nmax_receive_batch = 0\n"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("max_receive_batch"),
+            "file value validated too: {err}"
+        );
+        // A batch larger than the inbox cap is harmless and accepted.
+        let body = "[messages]\nmax_inbox_messages = 5\nmax_receive_batch = 16\n";
+        assert_eq!(
+            load_with_receive_batch(Some(body), None)
+                .unwrap()
+                .max_receive_batch,
+            16
+        );
+    }
+
+    // ── seat flap detection (optional; seat-contention freeze) ────────────────
+
+    const FLAP_VARS: [&str; 3] = [
+        "TOASTER_SEAT_FLAP_THRESHOLD",
+        "TOASTER_SEAT_FLAP_WINDOW_SECS",
+        "TOASTER_SEAT_FLAP_HOLD_DOWN_SECS",
+    ];
+
+    /// Load with an optional config-file body and a set of seat-flap env values.
+    fn load_with_flap(file_body: Option<&str>, env: &[(&str, &str)]) -> Result<Config, Error> {
+        set_test_secret();
+        for var in FLAP_VARS {
+            std::env::remove_var(var);
+        }
+        for (k, v) in env {
+            std::env::set_var(k, v);
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        if let Some(body) = file_body {
+            std::fs::write(&config_path, body).unwrap();
+        }
+        let args = CliArgs {
+            config: Some(config_path),
+            bind: None,
+            port: None,
+            log_level: None,
+        };
+        let result = Config::load(&args);
+        for var in FLAP_VARS {
+            std::env::remove_var(var);
+        }
+        clear_test_secret();
+        result
+    }
+
+    #[test]
+    fn test_seat_flap_defaults() {
+        // Rubric 8.20: unset → detection on with 3-in-30s / 60s hold-down.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = load_with_flap(None, &[]).unwrap();
+        assert_eq!(cfg.seat_flap_threshold, 3);
+        assert_eq!(cfg.seat_flap_window_secs, 30);
+        assert_eq!(cfg.seat_flap_hold_down_secs, 60);
+    }
+
+    #[test]
+    fn test_seat_flap_file_layer_then_env_override() {
+        // Rubric 8.20 (file → env precedence): the file sets all three; env
+        // overrides one, leaving the other two at their file values.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let body = "[rooms]\nseat_flap_threshold = 5\nseat_flap_window_secs = 10\nseat_flap_hold_down_secs = 120\n";
+        let cfg = load_with_flap(Some(body), &[]).unwrap();
+        assert_eq!(
+            (
+                cfg.seat_flap_threshold,
+                cfg.seat_flap_window_secs,
+                cfg.seat_flap_hold_down_secs
+            ),
+            (5, 10, 120)
+        );
+        let cfg = load_with_flap(Some(body), &[("TOASTER_SEAT_FLAP_WINDOW_SECS", "45")]).unwrap();
+        assert_eq!(
+            (
+                cfg.seat_flap_threshold,
+                cfg.seat_flap_window_secs,
+                cfg.seat_flap_hold_down_secs
+            ),
+            (5, 45, 120)
+        );
+    }
+
+    #[test]
+    fn test_seat_flap_threshold_zero_disables_and_bounds_enforced() {
+        // Rubric 8.20: 0 is the explicit opt-out; out-of-range values are fatal,
+        // never clamped.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = load_with_flap(None, &[("TOASTER_SEAT_FLAP_THRESHOLD", "0")]).unwrap();
+        assert_eq!(cfg.seat_flap_threshold, 0);
+        assert!(load_with_flap(None, &[("TOASTER_SEAT_FLAP_THRESHOLD", "1001")]).is_err());
+        assert!(load_with_flap(None, &[("TOASTER_SEAT_FLAP_WINDOW_SECS", "0")]).is_err());
+        assert!(load_with_flap(None, &[("TOASTER_SEAT_FLAP_WINDOW_SECS", "3601")]).is_err());
+        assert!(load_with_flap(None, &[("TOASTER_SEAT_FLAP_HOLD_DOWN_SECS", "0")]).is_err());
+        assert!(load_with_flap(None, &[("TOASTER_SEAT_FLAP_HOLD_DOWN_SECS", "86401")]).is_err());
     }
 }

@@ -2,7 +2,7 @@ use crate::{
     config::{Config, MasterSecret},
     error::Error,
     rooms::{RoomStore, RoomToken},
-    state::{DiagnosticSnapshot, SharedAppState},
+    state::{DiagnosticSnapshot, MemberName, SharedAppState},
 };
 use arc_swap::ArcSwap;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
@@ -315,7 +315,8 @@ async fn dispatch(
     }
 
     match parts[0].to_ascii_uppercase().as_str() {
-        "ADDRM" => cmd_addrm(&parts[1..], store, config).await,
+        "ADDRM" => cmd_addrm(&parts[1..], store, app, config, false).await,
+        "ADDRM_FORCE" => cmd_addrm(&parts[1..], store, app, config, true).await,
         "DELRM" => cmd_delrm(&parts[1..], store, app).await,
         "LSRM" => cmd_lsrm(store, app).await,
         "GTRM" => cmd_gtrm(&parts[1..], store, app).await,
@@ -338,15 +339,27 @@ async fn dispatch(
     }
 }
 
-// ── ADDRM ─────────────────────────────────────────────────────────────────────
+// ── ADDRM / ADDRM_FORCE ───────────────────────────────────────────────────────
 
-async fn cmd_addrm(args: &[String], store: &Arc<RwLock<RoomStore>>, config: &MgmtConfig) -> String {
+/// `ADDRM` refuses a name that already exists (`-ROOM_EXISTS "<name>" ...`);
+/// `ADDRM_FORCE` (same arguments) replaces it instead — dropping its seats,
+/// resetting its timestamps, and evicting its live members. Overwrite is a
+/// separate verb, not an in-band flag, because any keyword is also a legal
+/// room name.
+async fn cmd_addrm(
+    args: &[String],
+    store: &Arc<RwLock<RoomStore>>,
+    app: &SharedAppState,
+    config: &MgmtConfig,
+    force: bool,
+) -> String {
+    let verb = if force { "ADDRM_FORCE" } else { "ADDRM" };
     let (names, ttl) = match split_trailing_ttl(args) {
         Ok(v) => v,
         Err(e) => return err_response(&e),
     };
     if names.is_empty() {
-        return err_response("ADDRM requires at least one room name");
+        return err_response(&format!("{verb} requires at least one room name"));
     }
 
     let ttl_days = ttl.unwrap_or(config.default_room_ttl_days);
@@ -364,43 +377,81 @@ async fn cmd_addrm(args: &[String], store: &Arc<RwLock<RoomStore>>, config: &Mgm
 
     let mut results = Vec::new();
     for name in unique_names(names) {
-        let result = add_one_room(name, ttl_days, store, config).await;
+        let result = add_one_room(name, ttl_days, store, app, config, force).await;
         results.push((name.clone(), result));
     }
     render_batch(results)
 }
 
-/// Create one room. `Ok` is the `+ROOM_CREATED ...` line, `Err` the bare message.
+/// Create (or, with `force`, replace) one room. `Ok` is the `+ROOM_CREATED ...`
+/// line — with a trailing `replaced evicted:<n>` when an existing room was
+/// overwritten — and `Err` the bare message (`ROOM_EXISTS "<name>" ...` for a
+/// refused existing name, so the CLI can recognise it and offer to overwrite).
 async fn add_one_room(
     name: &str,
     ttl_days: u64,
     store: &Arc<RwLock<RoomStore>>,
+    app: &SharedAppState,
     config: &MgmtConfig,
+    force: bool,
 ) -> Result<String, String> {
     let result = {
         let mut store_write = store.write().await;
-        store_write
-            .create(
-                name.to_string(),
-                ttl_days,
-                config.max_rooms,
-                config.master_secret.as_bytes(),
-            )
-            .await
+        if force {
+            store_write
+                .create_or_replace(
+                    name.to_string(),
+                    ttl_days,
+                    config.max_rooms,
+                    config.master_secret.as_bytes(),
+                )
+                .await
+        } else {
+            store_write
+                .create(
+                    name.to_string(),
+                    ttl_days,
+                    config.max_rooms,
+                    config.master_secret.as_bytes(),
+                )
+                .await
+                .map(|room| (room, false))
+        }
     };
 
     match result {
-        Ok(room) => {
-            info!(room = %name, "room created via CLI");
+        Ok((room, replaced)) => {
             // Send the token back so the CLI can write the token file on its host.
             // Name is double-quoted so space-containing names parse correctly (F-006).
-            Ok(format!(
+            let mut line = format!(
                 "+ROOM_CREATED \"{}\" {} {}",
                 room.name, room.token, room.expires_at_secs
+            );
+            if replaced {
+                // The replaced room's seats are gone, so its live members —
+                // seat-authed ones especially — must not linger on credentials
+                // that no longer exist. Same eviction path as DELRM.
+                let evicted = {
+                    let mut app_write = app.write().await;
+                    app_write
+                        .evict_room(&room.token, &room.name, "room overwritten")
+                        .await
+                };
+                warn!(room = %name, members_evicted = evicted, "room overwritten via CLI (ADDRM_FORCE)");
+                line.push_str(&format!(" replaced evicted:{evicted}"));
+            } else {
+                info!(room = %name, force, "room created via CLI");
+            }
+            Ok(line)
+        }
+        Err(Error::RoomExists(_)) => {
+            warn!(room = %name, "ADDRM refused: room already exists (ADDRM_FORCE overwrites)");
+            Err(format!(
+                "ROOM_EXISTS \"{name}\" room already exists; ADDRM_FORCE overwrites it, dropping all its seats"
             ))
         }
         Err(e) => {
-            warn!(room = %name, error = %e, "ADDRM failed");
+            warn!(room = %name, error = %e, force, "ADDRM failed");
             Err(e.to_string())
         }
     }
@@ -514,7 +565,7 @@ async fn cmd_gtrm(args: &[String], store: &Arc<RwLock<RoomStore>>, app: &SharedA
         None => return err_response(&format!("room not found: {name}")),
     };
 
-    let mut members: Vec<String> = app_read
+    let mut members: Vec<MemberName> = app_read
         .rooms
         .get(&room.token)
         .map(|rs| rs.members.keys().cloned().collect())
@@ -559,8 +610,23 @@ async fn cmd_kckm(args: &[String], store: &Arc<RwLock<RoomStore>>, app: &SharedA
         if kicked.contains(member_name) || not_found.contains(member_name) {
             continue;
         }
+        // `kckm` is the operator's clear for a seat frozen by credential
+        // contention: drop its flap history so the next seat-token join is
+        // accepted normally (stop the duplicate agent first, or the two will
+        // resume fighting and re-trip the detector).
+        // A name that fails member-name validation can never have joined (every
+        // join path validates), so it is simply not found — same as before the
+        // `MemberName` newtype, when the lookups below just missed.
+        let Ok(name) = MemberName::new(member_name.as_str()) else {
+            not_found.push(member_name.clone());
+            continue;
+        };
+        if app_write.clear_seat_flap(&token, &name, Instant::now()) {
+            info!(room = %room_name, member = %member_name,
+                "seat contention freeze cleared by operator (KCKM)");
+        }
         if app_write
-            .evict_member(&token, room_name, member_name, "kicked by operator")
+            .evict_member(&token, room_name, &name, "kicked by operator")
             .await
         {
             kicked.push(member_name.clone());
@@ -615,6 +681,8 @@ async fn kick_all_in_room(
         .map_err(|e| e.trim_start_matches('-').to_string())?;
 
     let mut app_write = app.write().await;
+    // Clears every seat-contention freeze in the room, as KCKM does per member.
+    app_write.clear_room_seat_flaps(&token);
     let count = app_write
         .evict_all_members(&token, room_name, "all members kicked by operator")
         .await;
@@ -726,10 +794,17 @@ async fn del_one_seat(
             Err(e.to_string())
         }
         Ok(()) => {
-            let mut app_write = app.write().await;
-            app_write
-                .evict_member_superseded(room_token, room_name, member_name)
-                .await;
+            // The seat is gone: its contention history (and any freeze) goes too.
+            // A persisted seat name always passed validation when ADDMB wrote it;
+            // were it somehow invalid, no live member could hold it, so there is
+            // nothing to clear or evict.
+            if let Ok(name) = MemberName::new(member_name) {
+                let mut app_write = app.write().await;
+                app_write.clear_seat_flap(room_token, &name, Instant::now());
+                app_write
+                    .evict_member_superseded(room_token, room_name, &name)
+                    .await;
+            }
             info!(room = %room_name, member = %member_name, "seat token deleted via CLI");
             Ok(format!(
                 "+SEAT_DELETED \"{}\" \"{}\"",
@@ -883,6 +958,25 @@ fn render_dump_yaml(snap: &DiagnosticSnapshot) -> String {
                             out.push_str(&format!("        idle_eviction_secs: {secs}\n"))
                         }
                         None => out.push_str("        idle_eviction_secs: \"exempt\"\n"),
+                    }
+                    // Seat members only: flap-detection state, so credential
+                    // contention is visible before anyone reads the journal.
+                    if let Some(c) = &m.seat_contention {
+                        out.push_str(&format!(
+                            "        recent_supersedes: {}\n",
+                            c.recent_supersedes
+                        ));
+                        match c.last_supersede_secs_ago {
+                            Some(secs) => {
+                                out.push_str(&format!("        last_supersede_secs_ago: {secs}\n"))
+                            }
+                            None => out.push_str("        last_supersede_secs_ago: \"never\"\n"),
+                        }
+                        match c.frozen_secs_remaining {
+                            Some(secs) => out
+                                .push_str(&format!("        seat_frozen_secs_remaining: {secs}\n")),
+                            None => out.push_str("        seat_frozen_secs_remaining: \"no\"\n"),
+                        }
                     }
                 }
             }

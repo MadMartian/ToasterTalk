@@ -37,7 +37,8 @@ async fn connect_and_join(
     handle_join_room_token(app, store, session.clone(), room_token, member.to_string())
         .await
         .unwrap();
-    session
+    // The MCP tool params carry the raw wire string.
+    session.as_str().to_owned()
 }
 
 // ── TDD Rubric 8.6 ────────────────────────────────────────────────────────────

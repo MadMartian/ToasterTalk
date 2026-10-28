@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 /// ToasterTalk CLI — translates subcommands into wire requests sent to the
 /// running toaster-talk-server over its management transport (a Unix domain
@@ -44,6 +45,13 @@ enum Command {
         /// only valid when creating a single room
         #[arg(long)]
         file: Option<String>,
+        /// Overwrite any named room that already exists without asking. An
+        /// overwritten room keeps its room token but loses all of its seats,
+        /// gets a fresh expiry, and has its connected members evicted. Without
+        /// this flag an existing room is refused: interactively you are asked
+        /// to confirm each one; non-interactively the command fails.
+        #[arg(short = 'f', long)]
+        force: bool,
     },
     /// Delete one or more rooms
     Delrm {
@@ -121,16 +129,22 @@ async fn main() {
     let token_dir = cli.token_dir.unwrap_or_else(default_token_dir);
 
     match &cli.command {
-        Command::Addrm { names, ttl, file } => {
+        Command::Addrm {
+            names,
+            ttl,
+            file,
+            force,
+        } => {
             require_single_for_file(file.as_deref(), names.len());
-            let mut req = batch_request("ADDRM", &[], names);
-            if let Some(t) = ttl {
-                req.push_str(&format!(" TTL {t}"));
-            }
-            match send_request(&socket_path, &req).await {
-                Ok(response) => handle_addrm_response(&response, file.as_deref(), &token_dir),
-                Err(e) => fatal(e),
-            }
+            run_addrm(
+                &socket_path,
+                &token_dir,
+                names,
+                *ttl,
+                file.as_deref(),
+                *force,
+            )
+            .await;
         }
         Command::Delrm { names } => {
             let req = batch_request("DELRM", &[], names);
@@ -355,17 +369,117 @@ async fn send_request(socket_path: &Path, request: &str) -> Result<String, Strin
 
 // ── ADDRM ─────────────────────────────────────────────────────────────────────
 
-fn handle_addrm_response(response: &str, file_hint: Option<&str>, token_dir: &Path) {
-    let (ok_lines, failed) = split_batch_response(response);
-    for msg in ok_lines {
-        // ROOM_CREATED "<name>" <token> <expires_unix>
+/// `addrm`: send one batch `ADDRM` (or `ADDRM_FORCE` with `--force`), then deal
+/// with each name the server refused as already existing — one at a time,
+/// asking the operator on a TTY and failing otherwise. A declined or refused
+/// overwrite skips that room only; the rest of the batch is unaffected, and the
+/// command exits non-zero because that room was not (re)created.
+async fn run_addrm(
+    socket_path: &Path,
+    token_dir: &Path,
+    names: &[String],
+    ttl: Option<u64>,
+    file_hint: Option<&str>,
+    force: bool,
+) {
+    let verb = if force { "ADDRM_FORCE" } else { "ADDRM" };
+    let response = match send_request(socket_path, &addrm_request(verb, names, ttl)).await {
+        Ok(r) => r,
+        Err(e) => fatal(e),
+    };
+    let (mut failed, existing) = handle_addrm_response(&response, file_hint, token_dir);
+
+    let interactive = std::io::stdin().is_terminal();
+    for name in existing {
+        if !interactive {
+            eprintln!(
+                "error: room '{name}' already exists; not overwritten \
+                 (re-run with --force to overwrite it, which drops all its seats)"
+            );
+            failed = true;
+            continue;
+        }
+        if !confirm_overwrite(&name) {
+            println!("Skipped '{name}': room already exists and was not overwritten.");
+            failed = true;
+            continue;
+        }
+        let req = addrm_request("ADDRM_FORCE", std::slice::from_ref(&name), ttl);
+        match send_request(socket_path, &req).await {
+            Ok(r) => failed |= handle_addrm_response(&r, file_hint, token_dir).0,
+            Err(e) => fatal(e),
+        }
+    }
+    exit_if_failed(failed);
+}
+
+fn addrm_request(verb: &str, names: &[String], ttl: Option<u64>) -> String {
+    let mut req = batch_request(verb, &[], names);
+    if let Some(t) = ttl {
+        req.push_str(&format!(" TTL {t}"));
+    }
+    req
+}
+
+/// Ask on the terminal whether to overwrite an existing room. Default is No:
+/// anything but `y`/`yes` (including EOF or a read error) declines.
+fn confirm_overwrite(name: &str) -> bool {
+    eprint!("Room '{name}' exists; overwrite (drops all seats, evicts its members)? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    match std::io::stdin().read_line(&mut answer) {
+        Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        Err(_) => false,
+    }
+}
+
+/// The room name in a `ROOM_EXISTS "<name>" ...` failure line (bare, or with a
+/// batch `<name>: ` label in front). Room names hold no space or `"`, so the
+/// `ROOM_EXISTS "` marker cannot occur inside a label.
+fn room_exists_name(msg: &str) -> Option<String> {
+    let at = msg.find("ROOM_EXISTS \"")?;
+    parse_quoted_line(&msg[at..]).get(1).cloned()
+}
+
+/// Print the outcome of each `ADDRM`/`ADDRM_FORCE` response line, writing a
+/// token file per created room. Returns whether any line was a failure other
+/// than "room exists", and the names the server refused as already existing
+/// (left for the caller to confirm or refuse).
+fn handle_addrm_response(
+    response: &str,
+    file_hint: Option<&str>,
+    token_dir: &Path,
+) -> (bool, Vec<String>) {
+    let mut failed = false;
+    let mut existing = Vec::new();
+    for line in response.lines().filter(|l| !l.is_empty()) {
+        if let Some(err) = line.strip_prefix('-') {
+            match room_exists_name(err) {
+                Some(name) => existing.push(name),
+                None => {
+                    eprintln!("Server error: {err}");
+                    failed = true;
+                }
+            }
+            continue;
+        }
+        let msg = line.strip_prefix('+').unwrap_or(line);
+        // ROOM_CREATED "<name>" <token> <expires_unix> [replaced evicted:<n>]
         let fields = parse_quoted_line(msg);
         if fields.first().map(|s| s.as_str()) == Some("ROOM_CREATED") && fields.len() >= 3 {
             let name = &fields[1];
             let token = &fields[2];
             let expires = fields.get(3).map(|s| s.as_str()).unwrap_or("?");
             let (tok_path, reused) = write_token_file(name, token, file_hint, token_dir);
-            println!("Room created.");
+            if fields.get(4).map(|s| s.as_str()) == Some("replaced") {
+                let evicted = fields
+                    .get(5)
+                    .and_then(|s| s.strip_prefix("evicted:"))
+                    .unwrap_or("?");
+                println!("Room overwritten: all seats dropped, {evicted} member(s) evicted.");
+            } else {
+                println!("Room created.");
+            }
             println!("  Name:       {name}");
             println!("  Token file: {}{}", tok_path.display(), reuse_note(reused));
             println!("  Expires:    {}", format_unix_ts(expires));
@@ -373,7 +487,7 @@ fn handle_addrm_response(response: &str, file_hint: Option<&str>, token_dir: &Pa
             println!("{msg}");
         }
     }
-    exit_if_failed(failed);
+    (failed, existing)
 }
 
 /// Suffix for a printed token path when an identical file was already there.
@@ -828,6 +942,19 @@ fn format_unix_ts(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_room_exists_name_bare_and_batch_labelled() {
+        assert_eq!(
+            room_exists_name("ROOM_EXISTS \"qa\" room already exists; ...").as_deref(),
+            Some("qa")
+        );
+        assert_eq!(
+            room_exists_name("qa: ROOM_EXISTS \"qa\" room already exists").as_deref(),
+            Some("qa")
+        );
+        assert_eq!(room_exists_name("room limit reached"), None);
+    }
 
     #[test]
     fn test_format_unix_ts_looks_like_date() {

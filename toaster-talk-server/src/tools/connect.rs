@@ -1,13 +1,13 @@
 use crate::{
     error::Error,
-    state::SharedAppState,
+    state::{SessionToken, SharedAppState},
     tools::{new_session_token, session_id},
 };
 use tracing::info;
 
 #[derive(Debug)]
 pub struct ConnectResult {
-    pub session_token: String,
+    pub session_token: SessionToken,
 }
 
 /// Mint a session token — identity only, never a room membership (TDD 1a).
@@ -29,14 +29,14 @@ pub struct ConnectResult {
 ///   nothing worth invalidating and a fresh mint is issued regardless.
 pub async fn handle_connect(
     app: &SharedAppState,
-    old_session_token: Option<String>,
+    old_session_token: Option<SessionToken>,
 ) -> Result<ConnectResult, Error> {
     let session_token = new_session_token();
     let sid = session_id(&session_token);
 
     let mut app_write = app.write().await;
 
-    if let Some(old) = old_session_token.as_deref() {
+    if let Some(old) = old_session_token.as_ref() {
         if app_write.session_exists(old) {
             app_write.invalidate_session_fully(old).await;
         }
@@ -62,7 +62,7 @@ mod tests {
         let app = AppState::new();
 
         let result = handle_connect(&app, None).await.unwrap();
-        assert_eq!(result.session_token.len(), 64);
+        assert_eq!(result.session_token.as_str().len(), 64);
 
         let state = app.read().await;
         assert!(state.sessions.contains_key(&result.session_token));
@@ -95,7 +95,7 @@ mod tests {
             let mut state = app.write().await;
             state.register_room_membership(
                 crate::rooms::RoomToken::from("rt".to_string()),
-                "alice".into(),
+                crate::test_support::mn("alice"),
                 &first,
                 std::time::Instant::now(),
                 crate::state::AuthMethod::RoomToken,

@@ -3,7 +3,9 @@ use crate::{
     error::Error,
     host_cap,
     rooms::{RoomStore, RoomToken},
-    state::{Inbox, PushOutcome, QueuedMessage, ReplyWaitGuard, SharedAppState},
+    state::{
+        Inbox, MemberName, PushOutcome, QueuedMessage, ReplyWaitGuard, SessionToken, SharedAppState,
+    },
     tools::{format_last_seen, receive::park_on_inbox, session_id, InboxMessage, Timeout},
 };
 use std::{
@@ -23,6 +25,12 @@ pub struct SendResult {
     /// The reply(ies) delivered to a send-with-reply during its wait. Always empty
     /// for fire-and-forget — that path is strictly one-way (rubric 2.3).
     pub messages: Vec<InboxMessage>,
+    /// Messages from this room still queued in the sender's inbox after a
+    /// send-with-reply drained `messages`, because the batch hit the configured
+    /// `max_receive_batch` cap. Non-zero means "call receive (with this room) to
+    /// collect the rest" — the awaited reply may be among them. Always `0` for
+    /// fire-and-forget.
+    pub remaining: usize,
     /// Timeout status for the `await_reply_secs` wait, if one was requested.
     /// `None` when no `await_reply_secs` was supplied or a reply arrived.
     pub timeout: Timeout,
@@ -41,13 +49,16 @@ pub struct SendResult {
 /// - Send-with-reply: blocks on the sender's own inbox until a reply *from this
 ///   same room* arrives or `await_reply_secs` elapses, returning any reply in the
 ///   response. The room-filtered wait is mandatory here — a reply from a different
-///   room the sender also belongs to does not satisfy it and stays queued.
+///   room the sender also belongs to does not satisfy it and stays queued. The
+///   drain is capped at `config.max_receive_batch` exactly like `receive`; any
+///   further messages from this room stay queued in order (never discarded) and
+///   are counted in [`SendResult::remaining`].
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_send(
     app: &SharedAppState,
     config: &Config,
     store: &Arc<RwLock<RoomStore>>,
-    session_token: String,
+    session_token: SessionToken,
     room_name: String,
     to: String,
     message: String,
@@ -105,7 +116,7 @@ pub async fn handle_send(
         // Verify recipient is in the same room (rubric 2.5).
         let recipient = room_state
             .members
-            .get(&to)
+            .get(to.as_str())
             .ok_or_else(|| Error::MemberNotFound(to.clone()))?;
 
         let recipient_inbox = recipient.inbox.clone();
@@ -130,7 +141,7 @@ pub async fn handle_send(
         let sender = room_state
             .members
             .get_mut(&sender_name)
-            .ok_or_else(|| Error::MemberNotFound(sender_name.clone()))?;
+            .ok_or_else(|| Error::MemberNotFound(sender_name.to_string()))?;
         sender.last_seen = now;
         let sender_inbox = sender.inbox.clone();
 
@@ -205,7 +216,11 @@ pub async fn handle_send(
     // the mandatory counterpart of receive's optional room filter — while also
     // watching the recipient's inbox so the wait abandons promptly (rather than
     // draining the full timeout) if the recipient is evicted before replying.
-    let (reply_messages, reply_preempted) = if let Some(reply_timeout_secs) = effective_await_secs {
+    let ReplyWait {
+        messages: reply_messages,
+        remaining: reply_remaining,
+        preempted: reply_preempted,
+    } = if let Some(reply_timeout_secs) = effective_await_secs {
         wait_for_messages(
             sender_inbox.clone(),
             recipient_inbox.clone(),
@@ -214,10 +229,11 @@ pub async fn handle_send(
             &sender_name,
             room_token.clone(),
             room_name.clone(),
+            config.max_receive_batch,
         )
         .await?
     } else {
-        (vec![], false)
+        ReplyWait::default()
     };
 
     // A send-with-reply parks on the sender's own inbox for the reply window and is
@@ -255,7 +271,19 @@ pub async fn handle_send(
         info!(
             sender = %sender_name,
             message_count = all_messages.len(),
+            remaining = reply_remaining,
+            max_batch = config.max_receive_batch,
             "reply returned to sender in send-with-reply response"
+        );
+    }
+    if reply_remaining > 0 {
+        debug!(
+            session = %session_id(&session_token),
+            sender = %sender_name,
+            room = %room_name,
+            remaining = reply_remaining,
+            max_batch = config.max_receive_batch,
+            "send-with-reply batch capped — remainder left queued in order for the next receive"
         );
     }
 
@@ -264,8 +292,19 @@ pub async fn handle_send(
         ttl_secs: effective_ttl_secs,
         last_seen: last_seen_str,
         messages: all_messages,
+        remaining: reply_remaining,
         timeout,
     })
+}
+
+/// Outcome of a send-with-reply reply-wait: the drained (capped) batch, the count
+/// of same-room messages left queued past the cap, and whether the wait was
+/// preempted by a newer blocking call.
+#[derive(Default)]
+struct ReplyWait {
+    messages: Vec<InboxMessage>,
+    remaining: usize,
+    preempted: bool,
 }
 
 /// Block on the sender's own inbox until a reply *from `room_token`* arrives or
@@ -290,10 +329,11 @@ async fn wait_for_messages(
     recipient_inbox: Arc<Inbox>,
     timeout_secs: u64,
     peer: &str,
-    member_name: &str,
+    member_name: &MemberName,
     room_token: RoomToken,
     room_name: String,
-) -> Result<(Vec<InboxMessage>, bool), Error> {
+    max_batch: usize,
+) -> Result<ReplyWait, Error> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     // Count this in-flight reply-wait against the recipient's inbox for the whole
     // wait so the operator diagnostic doesn't misread the recipient's extra Arc
@@ -301,7 +341,7 @@ async fn wait_for_messages(
     // (MT-3). Dropped on every exit path, including cancellation.
     let _reply_guard = ReplyWaitGuard::new(recipient_inbox.clone());
     let outcome = tokio::select! {
-        outcome = park_on_inbox(inbox, deadline, member_name, move |rt| rt == &room_token) => outcome?,
+        outcome = park_on_inbox(inbox, deadline, member_name, max_batch, move |rt| rt == &room_token) => outcome?,
         _ = recipient_inbox.closed() => {
             warn!(peer = %peer, "send-with-reply aborted — recipient evicted before replying");
             return Err(Error::RecipientEvicted(peer.to_string()));
@@ -313,6 +353,7 @@ async fn wait_for_messages(
     }
 
     let preempted = outcome.preempted;
+    let remaining = outcome.remaining;
     let messages = outcome
         .messages
         .into_iter()
@@ -325,12 +366,17 @@ async fn wait_for_messages(
             msg
         })
         .collect();
-    Ok((messages, preempted))
+    Ok(ReplyWait {
+        messages,
+        remaining,
+        preempted,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::mn;
     use crate::{
         rooms::RoomStore,
         state::AppState,
@@ -346,8 +392,8 @@ mod tests {
     ) -> (
         crate::state::SharedAppState,
         Arc<RwLock<RoomStore>>,
-        String,
-        String,
+        SessionToken,
+        SessionToken,
     ) {
         let store_path = dir.path().join("rooms.yaml");
         let mut store = RoomStore::load(store_path).unwrap();
@@ -747,7 +793,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         // bob receives — the delivered message advertises the sender's reply window.
-        let recv = handle_receive(&app, &store, bob.clone(), 1, None, None)
+        let recv = handle_receive(&app, &store, bob.clone(), 1, None, None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(recv.messages.len(), 1);
@@ -789,7 +835,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let recv_ff = handle_receive(&app, &store, bob, 1, None, None)
+        let recv_ff = handle_receive(&app, &store, bob, 1, None, None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(recv_ff.messages.len(), 1);
@@ -840,7 +886,7 @@ mod tests {
                 .to_string();
             app.write()
                 .await
-                .evict_member(&token, "room", "bob", "kicked")
+                .evict_member(&token, "room", &mn("bob"), "kicked")
                 .await;
         }
 
@@ -941,10 +987,101 @@ mod tests {
         // And the unrelated message must still be sitting in the shared inbox,
         // retrievable via a receive filtered to other-room.
         use crate::tools::receive::handle_receive;
-        let recv = handle_receive(&app, &store, alice, 0, None, Some("other-room".into()))
+        let recv = handle_receive(
+            &app,
+            &store,
+            alice,
+            0,
+            None,
+            Some("other-room".into()),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recv.messages.len(), 1);
+        assert_eq!(recv.messages[0].body, "unrelated");
+    }
+
+    #[tokio::test]
+    async fn test_send_with_reply_drain_honours_batch_cap_and_strands_nothing() {
+        // Rubric 4.5: the send-with-reply reply drain is capped exactly like
+        // receive. Messages past the cap — possibly including the reply — stay
+        // queued in order and are reported in `remaining`, never discarded.
+        use crate::tools::receive::handle_receive;
+        let dir = TempDir::new().unwrap();
+        let (app, store, alice, bob) = connect_two(&dir).await;
+        let mut config = test_config();
+        config.max_receive_batch = 2;
+
+        // bob queues three messages for alice in this room before alice sends.
+        for body in ["r0", "r1", "r2"] {
+            handle_send(
+                &app,
+                &config,
+                &store,
+                bob.clone(),
+                "testroom".into(),
+                "alice".into(),
+                body.into(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_send(
+                &app,
+                &config,
+                &store,
+                alice.clone(),
+                "testroom".into(),
+                "bob".into(),
+                "question".into(),
+                None,
+                Some(3600),
+                None,
+            ),
+        )
+        .await
+        .expect("queued room messages must satisfy the reply-wait immediately")
+        .unwrap();
+        let bodies: Vec<_> = sent.messages.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["r0", "r1"]);
+        assert_eq!(sent.remaining, 1);
+        assert_eq!(sent.timeout, Timeout::None);
+
+        // The capped-off message is still queued for alice's next receive.
+        let recv = handle_receive(&app, &store, alice, 0, None, None, config.max_receive_batch)
             .await
             .unwrap();
         assert_eq!(recv.messages.len(), 1);
-        assert_eq!(recv.messages[0].body, "unrelated");
+        assert_eq!(recv.messages[0].body, "r2");
+        assert_eq!(recv.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_fire_and_forget_reports_zero_remaining() {
+        let dir = TempDir::new().unwrap();
+        let (app, store, alice, _bob) = connect_two(&dir).await;
+        let r = handle_send(
+            &app,
+            &test_config(),
+            &store,
+            alice,
+            "testroom".into(),
+            "bob".into(),
+            "hi".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.remaining, 0);
+        assert!(r.messages.is_empty());
     }
 }

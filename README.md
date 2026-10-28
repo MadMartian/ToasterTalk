@@ -18,7 +18,7 @@ The usual way to divvy up work — spawning sub-agents — stops at the machine 
 - **Persistent rooms**: named rooms support any number of members; one shared token gets everyone in
 - **Cross-machine, cross-platform**: agents on different hosts and OSes coordinate as peers — where sub-agent hierarchies can't reach past their own machine
 - **Fire-and-forget or round-trip**: send without waiting, or block until the peer replies — one tool handles both
-- **Staleness awareness**: every delivered message includes its queue age; tool responses flag members who haven't been seen recently, and crashed agents don't linger as phantoms — non-seat members are reaped after a server-configured idle TTL, and a dead seat (idle past a generous dead-seat window with no active receive) is reaped too so its inbox stops black-holing messages. A seat holder rejoins with the same name and reserved credential at any time, and messages queued while it was briefly away are carried over on reconnect
+- **Staleness awareness**: every delivered message includes its queue age; tool responses flag members who haven't been seen recently, and crashed agents don't linger as phantoms — non-seat members are reaped after a server-configured idle TTL, and a dead seat (idle past a generous dead-seat window with no active receive) is reaped too so its inbox stops black-holing messages. A seat holder rejoins with the same name and reserved credential at any time, and messages queued while it was briefly away are carried over on reconnect. If two live agents are mistakenly handed one seat and keep evicting each other, the server detects the flapping, logs a warning, and freezes the seat with one holder in place (tunable via `[rooms].seat_flap_*`; `kckm` clears it)
 - **Simple operator setup**: one CLI command creates a room and writes a token file; agents find it automatically
 - **Zero-downtime reconfiguration**: `systemctl reload` (Unix) or `toaster-talk-cli reload` (any platform) re-reads tunable settings in place — retune TTLs and timeouts without dropping a single agent connection
 
@@ -94,7 +94,7 @@ Get-Service ToasterTalk
 
 `install.ps1` writes a default config and generates a master secret under `%ProgramData%\ToasterTalk` on first run.
 
-> **Changed a setting?** Edit `config.toml` and run `sudo systemctl reload toaster-talk` (Linux) or `toaster-talk-cli reload` (any platform) — the daemon re-reads its tunable settings (message/room TTLs, timeouts, inbox cap, log level, …) in place **without dropping any agent connection**. The same reload also re-reads `rooms.yaml`, so a hand-edited room/seat expiry takes effect too. A few fields are restart-only (`bind`, `port`, `mgmt_socket`, the `store_path` *location* itself, `master_secret`) and need a full restart; a reload that changes one keeps the running value and logs a warning.
+> **Changed a setting?** Edit `config.toml` and run `sudo systemctl reload toaster-talk` (Linux) or `toaster-talk-cli reload` (any platform) — the daemon re-reads its tunable settings (message/room TTLs, timeouts, inbox cap, receive batch size, log level, …) in place **without dropping any agent connection**. The same reload also re-reads `rooms.yaml`, so a hand-edited room/seat expiry takes effect too. A few fields are restart-only (`bind`, `port`, `mgmt_socket`, the `store_path` *location* itself, `master_secret`) and need a full restart; a reload that changes one keeps the running value and logs a warning.
 
 ### 2. Create a room
 
@@ -107,9 +107,11 @@ toaster-talk-cli addrm "qa-review"
 ```
 
 For per-member credentials instead of a shared room token, create a **seat** for each
-participant — a `join` with that seat token unconditionally evicts (and supersedes)
-whatever session currently holds that seat's room/member, so an agent recovers by
-simply connecting and joining again:
+participant — a `join` with that seat token evicts (and supersedes) whatever session
+currently holds that seat's room/member, so an agent recovers by simply connecting and
+joining again (give every live agent its own seat: two agents sharing one seat would
+evict each other endlessly, so the server freezes a seat that flaps like that —
+see `SeatContention` in `sdd/SCHEMA.md`):
 
 ```bash
 toaster-talk-cli addmb "qa-review" "dev" "qa"
@@ -118,6 +120,14 @@ toaster-talk-cli addmb "qa-review" "dev" "qa"
 
 `addrm`, `delrm`, `kckall`, `addmb`, `delmb` and `kckm` all accept several names in one
 command. Re-running one writes no duplicate token files when the contents are identical.
+
+`addrm` never silently replaces a room that already exists. Overwriting a room keeps its
+room token but drops all of its seats (their `.tok` files stop working), resets its expiry,
+and evicts its connected members — so at a terminal `addrm` asks
+`Room '<name>' exists; overwrite (drops all seats, evicts its members)? [y/N]` for each
+existing room (default No: that room is skipped, the rest of the batch still runs). Without
+a terminal (scripts, CI) an existing room is an error and the command exits non-zero. Pass
+`-f` / `--force` to overwrite without asking.
 
 ### 3. Configure your AI client
 
@@ -203,7 +213,7 @@ Add the server using the SSE URL (classic SSE transport avoids Junie's hard HTTP
 
 Tell each agent its role when starting the task:
 
-> "Join the ToasterTalk room named 'qa-review' as member 'dev'. Call `connect` (no arguments) once to mint a session token. Then scan `~/.toaster-talk/tokens/` for the matching `.tok` file and call `join` with your session token, the room token, and your member name — this is the only way to attach to a room, including your first one. Use `send` (naming `room_name`) and `receive` (optionally naming `room`) to coordinate. If a response contains `timeout: capped`, your MCP host shortened the wait — call `receive` again immediately to keep waiting. Never re-call `send` to resume a capped reply wait: your message was already delivered, so re-sending would deliver a duplicate. If a message you receive carries `reply_expected_within_secs`, its sender is awaiting your reply within that many seconds — respond promptly by sending back to its `from` in that same room."
+> "Join the ToasterTalk room named 'qa-review' as member 'dev'. Call `connect` (no arguments) once to mint a session token. Then scan `~/.toaster-talk/tokens/` for the matching `.tok` file and call `join` with your session token, the room token, and your member name — this is the only way to attach to a room, including your first one. Use `send` (naming `room_name`) and `receive` (optionally naming `room`) to coordinate. If a response contains `timeout: capped`, your MCP host shortened the wait — call `receive` again immediately to keep waiting. If a response reports a non-zero `remaining`, more messages are queued than one call returns — call `receive` again right away until it is 0. Never re-call `send` to resume a capped reply wait: your message was already delivered, so re-sending would deliver a duplicate. If a message you receive carries `reply_expected_within_secs`, its sender is awaiting your reply within that many seconds — respond promptly by sending back to its `from` in that same room."
 
 The agent calls `connect` once per process to obtain a session token, then `join` once per room it needs (repeat `join` for additional rooms — one session, one shared inbox, spans all of them) before using `send` and `receive`. Call `leave` to drop out of a room voluntarily — the inverse of `join` — without affecting any other room the session belongs to; a seat holder can `join` the same room again later with the same seat token. Treat the session token as credential-grade: it now grants access to every room the session joins, not just one, so never log it in full or paste it insecurely. Only pass `old_session_token` back into `connect` if deliberately rotating a token you suspect leaked — doing so invalidates every room membership under it with no carryover, and each room must be `join`ed again afterward.
 

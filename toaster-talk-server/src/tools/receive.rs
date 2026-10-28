@@ -2,7 +2,7 @@ use crate::{
     error::Error,
     host_cap,
     rooms::{RoomStore, RoomToken},
-    state::{Inbox, QueuedMessage, SharedAppState},
+    state::{Inbox, QueuedMessage, SessionToken, SharedAppState},
     tools::{session_id, InboxMessage, Timeout},
 };
 use std::{
@@ -57,6 +57,9 @@ impl Drop for ReceiveGuard {
 /// Outcome of parking on an inbox via [`park_on_inbox`].
 pub(crate) struct ParkOutcome {
     pub messages: Vec<QueuedMessage>,
+    /// Still-valid messages matching the same filter left queued because the
+    /// per-call batch cap was reached (`0` on timeout or preemption).
+    pub remaining: usize,
     /// `true` if this waiter was preempted (aborted) by a newer one — distinct from
     /// a genuine timeout, so callers can report `Timeout::None` rather than `Elapsed`.
     pub preempted: bool,
@@ -79,10 +82,17 @@ pub(crate) struct ParkOutcome {
 /// send-with-reply's mandatory one are both just predicates passed here — this is
 /// *not* a new preemption model: still one inbox, one slot, one live waiter, same
 /// chokepoint. Pass `|_| true` for "any room."
+///
+/// `max_batch` caps how many matching messages one wakeup drains (config
+/// `max_receive_batch`); the rest stay queued, in order, and are counted in
+/// [`ParkOutcome::remaining`]. Every caller — `receive` and send-with-reply alike —
+/// passes the same configured cap, so no blocking-read path can return an
+/// unbounded batch.
 pub(crate) async fn park_on_inbox(
     inbox: Arc<Inbox>,
     deadline: Instant,
     member_name: &str,
+    max_batch: usize,
     filter: impl Fn(&RoomToken) -> bool + Send + Sync + 'static,
 ) -> Result<ParkOutcome, Error> {
     if inbox.is_receive_active() {
@@ -100,18 +110,24 @@ pub(crate) async fn park_on_inbox(
     // does not silently detach it — the guard explicitly aborts it via the handle.
     let subtask = tokio::spawn({
         let inbox = inbox.clone();
-        async move { inbox.wait_drain_until_filtered(deadline, filter).await }
+        async move {
+            inbox
+                .wait_drain_until_filtered(deadline, filter, max_batch)
+                .await
+        }
     });
     inbox.set_receive_abort(subtask.abort_handle());
     guard.set_abort(subtask.abort_handle());
 
     match subtask.await {
-        Ok(messages) => Ok(ParkOutcome {
-            messages,
+        Ok(drained) => Ok(ParkOutcome {
+            messages: drained.messages,
+            remaining: drained.remaining,
             preempted: false,
         }),
         Err(e) if e.is_cancelled() => Ok(ParkOutcome {
             messages: vec![],
+            remaining: 0,
             preempted: true,
         }),
         Err(e) => Err(Error::Internal(format!("inbox wait task panicked: {e}"))),
@@ -121,6 +137,10 @@ pub(crate) async fn park_on_inbox(
 #[derive(Debug)]
 pub struct ReceiveResult {
     pub messages: Vec<InboxMessage>,
+    /// Messages matching this call's room filter still queued after the drain,
+    /// because the batch hit `max_batch`. Non-zero means "call receive again" —
+    /// that call returns immediately with the next batch.
+    pub remaining: usize,
     pub timeout: Timeout,
 }
 
@@ -129,22 +149,29 @@ pub struct ReceiveResult {
 ///
 /// `room` is optional (TDD 3.8, 3.9, 3.10):
 /// - Omitted (default): blocks until a message from *any* of the session's rooms
-///   arrives, and drains everything currently valid across all of them. Each
+///   arrives, and drains the oldest valid messages across all of them. Each
 ///   returned message carries its `room`.
 /// - Supplied: blocks (and drains) only messages tagged with that specific room,
 ///   leaving messages from the session's other rooms queued for a later call.
 ///
+/// At most `max_batch` messages are returned per call (config
+/// `max_receive_batch`); the cap applies to the filtered drain. Matching messages
+/// beyond it stay queued in FIFO order and are reported in
+/// [`ReceiveResult::remaining`], so the caller knows to receive again — the next
+/// call finds them already queued and returns without blocking.
+///
 /// If a receive is already active when this call arrives, the stale connection is
 /// preempted: its sub-task is aborted and this call claims the slot. This handles
 /// the case where the MCP host or network dropped the previous connection without
-/// cancelling the server-side handler future (ISS-006).
+/// cancelling the server-side handler future.
 pub async fn handle_receive(
     app: &SharedAppState,
     store: &Arc<RwLock<RoomStore>>,
-    session_token: String,
+    session_token: SessionToken,
     timeout_secs: u64,
     host_cap_secs: Option<u64>,
     room: Option<String>,
+    max_batch: usize,
 ) -> Result<ReceiveResult, Error> {
     // Resolve the optional room filter to a token up front (needs the store, so
     // done before taking the AppState lock — consistent with connect/join/send).
@@ -201,23 +228,23 @@ pub async fn handle_receive(
 
     let deadline = Instant::now() + Duration::from_secs(effective_timeout_secs);
 
-    debug!(session = %session_id(&session_token), room = %member_label, effective_timeout_secs, was_capped, "receive waiting for messages");
+    debug!(session = %session_id(&session_token), room = %member_label, effective_timeout_secs, was_capped, max_batch, "receive waiting for messages");
 
     // Single preemptible-slot park — preempts any stale/orphaned waiter so a zombie
     // cannot steal this receive's wakeup. The filter is the room-scoping predicate:
     // "any room" when `room` was omitted, or an exact-token match when it wasn't.
     let wait_filter = filter_room_token.clone();
-    let outcome =
-        park_on_inbox(
-            inbox,
-            deadline,
-            &member_label,
-            move |rt: &RoomToken| match &wait_filter {
-                Some(target) => rt == target,
-                None => true,
-            },
-        )
-        .await?;
+    let outcome = park_on_inbox(
+        inbox,
+        deadline,
+        &member_label,
+        max_batch,
+        move |rt: &RoomToken| match &wait_filter {
+            Some(target) => rt == target,
+            None => true,
+        },
+    )
+    .await?;
 
     // Re-anchor the idle window at *completion*. A room-omitted receive parks on
     // the whole shared inbox, blanket-exempting every one of the session's rooms
@@ -261,11 +288,23 @@ pub async fn handle_receive(
         info!(
             session = %session_id(&session_token),
             message_count = delivered.len(),
+            remaining = outcome.remaining,
+            max_batch,
             "receive completed with messages"
         );
+        if outcome.remaining > 0 {
+            debug!(
+                session = %session_id(&session_token),
+                room = %member_label,
+                remaining = outcome.remaining,
+                max_batch,
+                "receive batch capped — remainder left queued in order for the next receive"
+            );
+        }
 
         return Ok(ReceiveResult {
             messages: delivered,
+            remaining: outcome.remaining,
             timeout: host_cap::apply_timeout(was_capped, false),
         });
     }
@@ -290,6 +329,7 @@ pub async fn handle_receive(
     }
     Ok(ReceiveResult {
         messages: vec![],
+        remaining: 0,
         timeout,
     })
 }
@@ -317,6 +357,7 @@ async fn resolve_room_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::mn;
     use crate::{
         rooms::RoomStore,
         state::{AppState, QueuedMessage},
@@ -337,7 +378,11 @@ mod tests {
 
     async fn setup(
         dir: &TempDir,
-    ) -> (crate::state::SharedAppState, Arc<RwLock<RoomStore>>, String) {
+    ) -> (
+        crate::state::SharedAppState,
+        Arc<RwLock<RoomStore>>,
+        SessionToken,
+    ) {
         let store_path = dir.path().join("rooms.yaml");
         let mut store = RoomStore::load(store_path).unwrap();
         let room = store
@@ -374,7 +419,7 @@ mod tests {
                     .try_push(
                         QueuedMessage {
                             id: Uuid::new_v4(),
-                            from: from.into(),
+                            from: mn(from),
                             room: RoomToken::from(room.to_string()),
                             body: body.into(),
                             enqueued_at: now,
@@ -409,7 +454,7 @@ mod tests {
         let room_token = room_token_for(&store, "testroom").await;
         push_to(&app, "alice", "bob", &room_token, "hello").await;
 
-        let result = handle_receive(&app, &store, session, 1, None, None)
+        let result = handle_receive(&app, &store, session, 1, None, None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(result.timeout, Timeout::None);
@@ -426,7 +471,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (app, store, session) = setup(&dir).await;
 
-        let result = handle_receive(&app, &store, session, 0, None, None)
+        let result = handle_receive(&app, &store, session, 0, None, None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(result.timeout, Timeout::Elapsed);
@@ -444,7 +489,7 @@ mod tests {
 
         let resolved = 0u64;
 
-        let result = handle_receive(&app, &store, session, resolved, None, None)
+        let result = handle_receive(&app, &store, session, resolved, None, None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(result.timeout, Timeout::Elapsed);
@@ -453,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_receive_returns_multiple_messages_in_enqueue_order() {
-        // Rubric 3.3: all queued messages are returned in a single batch in enqueue order.
+        // Rubric 3.3: queued messages (within the batch cap) are returned in enqueue order.
         let dir = TempDir::new().unwrap();
         let (app, store, session) = setup(&dir).await;
         let room_token = room_token_for(&store, "testroom").await;
@@ -461,7 +506,7 @@ mod tests {
         push_to(&app, "alice", "charlie", &room_token, "second").await;
         push_to(&app, "alice", "dave", &room_token, "third").await;
 
-        let result = handle_receive(&app, &store, session, 1, None, None)
+        let result = handle_receive(&app, &store, session, 1, None, None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(result.timeout, Timeout::None);
@@ -491,7 +536,7 @@ mod tests {
         }
 
         // New receive must preempt the stale slot and succeed.
-        let result = handle_receive(&app, &store, session, 0, None, None).await;
+        let result = handle_receive(&app, &store, session, 0, None, None, usize::MAX).await;
         assert!(
             result.is_ok(),
             "receive must preempt stale slot, not return an error: {result:?}"
@@ -512,7 +557,16 @@ mod tests {
         let store_clone = store.clone();
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
-            handle_receive(&app_clone, &store_clone, session_clone, 60, None, None).await
+            handle_receive(
+                &app_clone,
+                &store_clone,
+                session_clone,
+                60,
+                None,
+                None,
+                usize::MAX,
+            )
+            .await
         });
         // Give the task a moment to claim the receive slot before aborting.
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -521,7 +575,7 @@ mod tests {
 
         // The receive slot must have been released by ReceiveGuard::drop().
         // A second receive call must succeed.
-        let result = handle_receive(&app, &store, session, 0, None, None).await;
+        let result = handle_receive(&app, &store, session, 0, None, None, usize::MAX).await;
         assert!(
             result.is_ok(),
             "receive slot must be free after cancellation: {result:?}"
@@ -544,12 +598,21 @@ mod tests {
         let store_clone = store.clone();
         let session_clone = session.clone();
         let first = tokio::spawn(async move {
-            handle_receive(&app_clone, &store_clone, session_clone, 3600, None, None).await
+            handle_receive(
+                &app_clone,
+                &store_clone,
+                session_clone,
+                3600,
+                None,
+                None,
+                usize::MAX,
+            )
+            .await
         });
         tokio::time::sleep(Duration::from_millis(20)).await; // let it claim + park
 
         // Second receive preempts the first, then elapses empty itself.
-        let second = handle_receive(&app, &store, session, 0, None, None)
+        let second = handle_receive(&app, &store, session, 0, None, None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(second.timeout, Timeout::Elapsed);
@@ -571,7 +634,7 @@ mod tests {
         let (app, store, session) = setup(&dir).await;
 
         // cap=0 < timeout=60: capped wait expires immediately
-        let result = handle_receive(&app, &store, session, 60, Some(0), None)
+        let result = handle_receive(&app, &store, session, 60, Some(0), None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(result.timeout, Timeout::Capped);
@@ -588,7 +651,7 @@ mod tests {
         push_to(&app, "alice", "bob", &room_token, "hi").await;
 
         // cap=60, timeout=3600: message is already queued so it's delivered immediately
-        let result = handle_receive(&app, &store, session, 3600, Some(60), None)
+        let result = handle_receive(&app, &store, session, 3600, Some(60), None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(result.timeout, Timeout::None);
@@ -642,6 +705,7 @@ mod tests {
             1,
             None,
             Some("room-a".into()),
+            usize::MAX,
         )
         .await
         .unwrap();
@@ -650,9 +714,17 @@ mod tests {
         assert_eq!(result.messages[0].body, "from-a");
 
         // room-b's message is still queued for a later call.
-        let result_b = handle_receive(&app, &store, session, 1, None, Some("room-b".into()))
-            .await
-            .unwrap();
+        let result_b = handle_receive(
+            &app,
+            &store,
+            session,
+            1,
+            None,
+            Some("room-b".into()),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
         assert_eq!(result_b.messages.len(), 1);
         assert_eq!(result_b.messages[0].room, "room-b");
         assert_eq!(result_b.messages[0].body, "from-b");
@@ -698,7 +770,7 @@ mod tests {
         push_to(&app, "alice-a", "bob", room_a.token.as_str(), "from-a").await;
         push_to(&app, "alice-b", "carol", room_b.token.as_str(), "from-b").await;
 
-        let result = handle_receive(&app, &store, session, 1, None, None)
+        let result = handle_receive(&app, &store, session, 1, None, None, usize::MAX)
             .await
             .unwrap();
         assert_eq!(result.messages.len(), 2);
@@ -712,8 +784,16 @@ mod tests {
     async fn test_receive_room_filter_unknown_room_name_is_room_not_found() {
         let dir = TempDir::new().unwrap();
         let (app, store, session) = setup(&dir).await;
-        let result =
-            handle_receive(&app, &store, session, 0, None, Some("no-such-room".into())).await;
+        let result = handle_receive(
+            &app,
+            &store,
+            session,
+            0,
+            None,
+            Some("no-such-room".into()),
+            usize::MAX,
+        )
+        .await;
         assert!(matches!(result.unwrap_err(), Error::RoomNotFound(_)));
     }
 
@@ -738,7 +818,16 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handle_receive(&app, &store, session, 0, None, Some("room-b".into())).await;
+        let result = handle_receive(
+            &app,
+            &store,
+            session,
+            0,
+            None,
+            Some("room-b".into()),
+            usize::MAX,
+        )
+        .await;
         assert!(matches!(result.unwrap_err(), Error::NotConnectedToRoom(_)));
     }
 
@@ -752,7 +841,7 @@ mod tests {
         let app = AppState::new();
         let session = handle_connect(&app, None).await.unwrap().session_token;
 
-        let result = handle_receive(&app, &store, session, 0, None, None).await;
+        let result = handle_receive(&app, &store, session, 0, None, None, usize::MAX).await;
         assert!(matches!(result.unwrap_err(), Error::NotJoinedAnyRoom));
     }
 
@@ -773,6 +862,7 @@ mod tests {
                     inbox,
                     Instant::now() + Duration::from_secs(30),
                     "alice",
+                    usize::MAX,
                     |_| true,
                 )
                 .await
@@ -788,6 +878,7 @@ mod tests {
                     inbox,
                     Instant::now() + Duration::from_secs(30),
                     "alice",
+                    usize::MAX,
                     |_| true,
                 )
                 .await
@@ -801,7 +892,7 @@ mod tests {
             .try_push(
                 QueuedMessage {
                     id: Uuid::new_v4(),
-                    from: "bob".into(),
+                    from: mn("bob"),
                     room: RoomToken::from("rt".to_string()),
                     body: "reply".into(),
                     enqueued_at: now,
@@ -829,5 +920,138 @@ mod tests {
             a_out.preempted,
             "the orphaned waiter must have been preempted"
         );
+    }
+
+    #[tokio::test]
+    async fn test_receive_batch_cap_returns_oldest_and_reports_remaining() {
+        // Rubric 3.11: a receive returns at most `max_batch` messages, oldest
+        // first, and reports how many are still queued.
+        let dir = TempDir::new().unwrap();
+        let (app, store, session) = setup(&dir).await;
+        let rt = room_token_for(&store, "testroom").await;
+        for i in 0..5 {
+            push_to(&app, "alice", "bob", &rt, &format!("m{i}")).await;
+        }
+
+        let first = handle_receive(&app, &store, session.clone(), 1, None, None, 3)
+            .await
+            .unwrap();
+        let bodies: Vec<_> = first.messages.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["m0", "m1", "m2"]);
+        assert_eq!(first.remaining, 2);
+        assert_eq!(first.timeout, Timeout::None);
+    }
+
+    #[tokio::test]
+    async fn test_receive_batch_remainder_returned_in_order_without_blocking() {
+        // Rubric 3.12: the remainder of a capped batch is returned, in order, by
+        // the next receive — immediately, even with a long timeout — and nothing
+        // is lost across successive capped drains.
+        let dir = TempDir::new().unwrap();
+        let (app, store, session) = setup(&dir).await;
+        let rt = room_token_for(&store, "testroom").await;
+        for i in 0..7 {
+            push_to(&app, "alice", "bob", &rt, &format!("m{i}")).await;
+        }
+
+        let mut seen = Vec::new();
+        let mut remaining_trail = Vec::new();
+        loop {
+            // A 3600 s timeout would hang the test if a queued remainder failed to
+            // short-circuit the wait — bound it well below that.
+            let r = tokio::time::timeout(
+                Duration::from_secs(2),
+                handle_receive(&app, &store, session.clone(), 3600, None, None, 3),
+            )
+            .await
+            .expect("receive with a queued remainder must return without blocking")
+            .unwrap();
+            seen.extend(r.messages.iter().map(|m| m.body.clone()));
+            remaining_trail.push(r.remaining);
+            if r.remaining == 0 {
+                break;
+            }
+        }
+        let expected: Vec<String> = (0..7).map(|i| format!("m{i}")).collect();
+        assert_eq!(seen, expected, "FIFO order preserved, nothing lost");
+        assert_eq!(remaining_trail, [4, 1, 0]);
+    }
+
+    #[tokio::test]
+    async fn test_receive_batch_cap_applies_to_room_filtered_drain() {
+        // Rubric 3.13: with a room filter, the cap counts only that room's
+        // messages; other rooms' messages stay queued and are not counted in
+        // `remaining`.
+        let dir = TempDir::new().unwrap();
+        let store_path = dir.path().join("rooms.yaml");
+        let mut store = RoomStore::load(store_path).unwrap();
+        let room_a = store
+            .create("room-a".into(), 30, 50, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+        let room_b = store
+            .create("room-b".into(), 30, 50, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+        let store = Arc::new(RwLock::new(store));
+        let app = AppState::new();
+        let session = handle_connect(&app, None).await.unwrap().session_token;
+        for (room, name) in [(&room_a, "alice-a"), (&room_b, "alice-b")] {
+            handle_join_room_token(
+                &app,
+                &store,
+                session.clone(),
+                room.token.to_string(),
+                name.into(),
+            )
+            .await
+            .unwrap();
+        }
+        // Interleave: b0 a0 b1 a1 a2 b2
+        for (who, rt, body) in [
+            ("alice-b", room_b.token.as_str(), "b0"),
+            ("alice-a", room_a.token.as_str(), "a0"),
+            ("alice-b", room_b.token.as_str(), "b1"),
+            ("alice-a", room_a.token.as_str(), "a1"),
+            ("alice-a", room_a.token.as_str(), "a2"),
+            ("alice-b", room_b.token.as_str(), "b2"),
+        ] {
+            push_to(&app, who, "peer", rt, body).await;
+        }
+
+        let a = handle_receive(
+            &app,
+            &store,
+            session.clone(),
+            1,
+            None,
+            Some("room-a".into()),
+            2,
+        )
+        .await
+        .unwrap();
+        let bodies: Vec<_> = a.messages.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["a0", "a1"]);
+        assert_eq!(a.remaining, 1, "only room-a's leftover counts");
+
+        // Unfiltered drain sees the rest in original enqueue order.
+        let rest = handle_receive(&app, &store, session, 1, None, None, 16)
+            .await
+            .unwrap();
+        let bodies: Vec<_> = rest.messages.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["b0", "b1", "a2", "b2"]);
+        assert_eq!(rest.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_receive_timeout_reports_zero_remaining() {
+        let dir = TempDir::new().unwrap();
+        let (app, store, session) = setup(&dir).await;
+        let r = handle_receive(&app, &store, session, 0, None, None, 3)
+            .await
+            .unwrap();
+        assert!(r.messages.is_empty());
+        assert_eq!(r.remaining, 0);
+        assert_eq!(r.timeout, Timeout::Elapsed);
     }
 }

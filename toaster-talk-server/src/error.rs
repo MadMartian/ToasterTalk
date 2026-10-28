@@ -54,6 +54,19 @@ pub enum Error {
     #[error("invalid or expired seat token")]
     InvalidSeatToken,
 
+    #[error(
+        "seat '{member}' in room '{room}' is frozen for another {retry_after_secs}s: seat credential \
+         contention detected (this seat was superseded repeatedly within a short window, which means \
+         two live agents are probably sharing one seat token). The current holder keeps the seat. Do \
+         not retry in a loop and do not join under a different name; surface this to the operator, \
+         who can clear the freeze with `kckm`"
+    )]
+    SeatContention {
+        room: String,
+        member: String,
+        retry_after_secs: u64,
+    },
+
     #[error("no seat token registered for member '{0}' in this room")]
     SeatNotFound(String),
 
@@ -63,6 +76,12 @@ pub enum Error {
         "cross-room messaging is not permitted; sender and recipient must be in the same room"
     )]
     CrossRoomMessage,
+
+    /// `ADDRM` named a room that already exists. Creation never silently
+    /// replaces a live room (that would empty its seats and reset its expiry);
+    /// replacing one requires the explicit overwrite command (`ADDRM_FORCE`).
+    #[error("room already exists: {0}")]
+    RoomExists(String),
 
     #[error("room limit reached: server is at maximum capacity ({max} rooms)")]
     RoomLimitReached { max: usize },

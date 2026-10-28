@@ -42,7 +42,7 @@ Direct `send` (fire-and-forget and send-with-reply) remains unchanged. Broadcast
 
 ## Constraints and open questions
 
-- **Inbox capacity**: Broadcast amplifies the DoS concern from ISS-001. Publishing to a room with 20 members creates 20 inbox entries simultaneously. Any inbox cap must be applied per recipient, not per sender.
+- **Inbox capacity**: Broadcast amplifies inbox-flooding pressure: one send becomes N queued entries. Publishing to a room with 20 members creates 20 inbox entries simultaneously. Any inbox cap must be applied per recipient, not per sender.
 - **Per-room vs. cross-room topics**: Topics are scoped to the room. A member cannot subscribe to topics in another room.
 - **Persistence**: Subscriptions are in-memory only (like all agent state). A member that disconnects and reconnects must re-subscribe.
 - **Tool naming conflict**: `subscribe`/`unsubscribe`/`publish` are reserved for this design. Do not use these names for other purposes.

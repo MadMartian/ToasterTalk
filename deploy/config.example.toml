@@ -35,6 +35,16 @@ store_path       = "/var/lib/toaster-talk/rooms.yaml"  # [restart-only location]
 max_rooms        = 50                                   # Hard ceiling on active rooms
 default_ttl_days = 30                                   # Default room TTL
 max_ttl_days     = 365                                  # Hard ceiling (1 year)
+# Seat-credential contention (flap) detection. Two live agents holding ONE seat
+# token supersede each other on every join, forever. A seat superseded more than
+# seat_flap_threshold times within seat_flap_window_secs logs a WARN ("seat
+# credential contention — possible shared token") and is frozen for
+# seat_flap_hold_down_secs: the current holder keeps the seat and superseding
+# seat-token joins fail with SeatContention. `toaster-talk-cli kckm <room> <member>`
+# (or kckall / delmb) clears a freeze early. seat_flap_threshold = 0 disables.
+seat_flap_threshold      = 3    # 0..=1000 (0 = disabled)
+seat_flap_window_secs    = 30   # 1..=3600
+seat_flap_hold_down_secs = 60   # 1..=86400
 
 [messages]
 default_ttl_secs             = 660    # Default message TTL (11 minutes)
@@ -53,3 +63,5 @@ default_receive_timeout_secs = 30     # Default receive() wait when timeout_secs
 max_await_reply_secs         = 3600   # Hard ceiling on send() await_reply_secs
 max_receive_timeout_secs     = 3600   # Hard ceiling on receive() timeout_secs
 max_inbox_messages           = 100    # Per-member inbox capacity (send rejected when full)
+max_receive_batch            = 16     # Most messages one receive() returns (1..=1000); the rest stay
+                                      #   queued in order and the response reports `remaining`

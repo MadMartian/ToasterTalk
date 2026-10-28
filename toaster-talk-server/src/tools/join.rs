@@ -1,12 +1,15 @@
 use crate::{
     error::Error,
     rooms::{RoomStore, RoomToken},
-    state::{AuthMethod, MembershipCheck, SharedAppState},
-    tools::{session_id, validate_member_name},
+    state::{
+        AuthMethod, FlapOutcome, MemberName, MembershipCheck, SeatFlapPolicy, SessionToken,
+        SharedAppState,
+    },
+    tools::session_id,
 };
 use std::{sync::Arc, time::Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 #[derive(Debug)]
 pub struct JoinResult {
@@ -27,14 +30,23 @@ pub struct JoinResult {
 pub async fn handle_join_room_token(
     app: &SharedAppState,
     store: &Arc<RwLock<RoomStore>>,
-    session_token: String,
+    session_token: SessionToken,
     room_token: String,
     member_name: String,
 ) -> Result<JoinResult, Error> {
-    validate_member_name(&member_name)?;
+    let member_name = MemberName::new(member_name)?;
 
+    // Lock order: RoomStore read guard FIRST, then the AppState write lock — the
+    // same store → app nesting `LSRM` and the TTL sweep use; no path ever takes the
+    // store while holding app state, so this cannot deadlock. The store guard is
+    // deliberately held until the membership is registered: a room deletion
+    // (`DELRM`, expiry sweep) needs the store WRITE lock, so it can no longer slip
+    // in between "credential verified" and "membership registered" and leave a
+    // membership attached to a room that no longer exists. The deletion instead
+    // runs after this join completes and evicts the fresh membership like any
+    // other. Only lock acquisition is awaited while the guard is held.
+    let store_read = store.read().await;
     let room_name = {
-        let store_read = store.read().await;
         let room = store_read
             .verify_token(&room_token)
             .ok_or(Error::InvalidRoomToken)?;
@@ -47,6 +59,7 @@ pub async fn handle_join_room_token(
     };
 
     let mut app_write = app.write().await;
+    trace!(room = %room_name, member = %member_name, "join holding store read + app write locks");
 
     match app_write.check_room_membership(&session_token, &room_token) {
         MembershipCheck::Superseded => return Err(Error::Superseded),
@@ -64,7 +77,7 @@ pub async fn handle_join_room_token(
         .is_some()
     {
         warn!(room = %room_name, member = %member_name, "join rejected — member name already in use");
-        return Err(Error::MemberNameTaken(member_name));
+        return Err(Error::MemberNameTaken(member_name.into_string()));
     }
 
     let now = Instant::now();
@@ -76,6 +89,7 @@ pub async fn handle_join_room_token(
         AuthMethod::RoomToken,
     );
     drop(app_write);
+    drop(store_read);
 
     info!(room = %room_name, member = %member_name, session = %session_id(&session_token), "member joined room via room token");
 
@@ -84,21 +98,55 @@ pub async fn handle_join_room_token(
 
 /// Attach a room membership to an existing session, using a seat token (member
 /// credential). Preserves today's existing (and deliberate) asymmetry with the
-/// room-token path: a seat-token collision unconditionally evicts the existing
+/// room-token path: a seat-token collision evicts the existing
 /// holder's membership *in this room only* (`Superseded`) and registers the new
 /// one, exactly like the historical seat-connect behavior — just invoked through
-/// `join` (TDD 1b, 12.2).
+/// `join` (TDD 1b, 12.2). The one exception is a seat frozen by flap detection
+/// (see [`handle_join_seat_with_policy`]).
+///
+/// Uses the default [`SeatFlapPolicy`]; the MCP server calls
+/// [`handle_join_seat_with_policy`] with the policy from the live config.
 pub async fn handle_join_seat(
     app: &SharedAppState,
     store: &Arc<RwLock<RoomStore>>,
-    session_token: String,
+    session_token: SessionToken,
     seat_token: String,
     member_name: String,
 ) -> Result<JoinResult, Error> {
-    validate_member_name(&member_name)?;
+    handle_join_seat_with_policy(
+        app,
+        store,
+        SeatFlapPolicy::default(),
+        session_token,
+        seat_token,
+        member_name,
+    )
+    .await
+}
 
+/// [`handle_join_seat`] with an explicit seat-contention flap policy (TDD 12.6,
+/// 12.7). Every supersession is counted per seat; once the seat has been
+/// superseded more than `policy.threshold` times within `policy.window`, it is
+/// frozen for `policy.hold_down`: a seat-token join that would supersede the
+/// current holder is rejected with `SeatContention` and the holder keeps its
+/// membership, so two agents sharing one seat credential settle on one winner
+/// instead of evicting each other forever. A frozen seat with no current holder
+/// can still be claimed — the freeze only blocks supersession.
+pub async fn handle_join_seat_with_policy(
+    app: &SharedAppState,
+    store: &Arc<RwLock<RoomStore>>,
+    policy: SeatFlapPolicy,
+    session_token: SessionToken,
+    seat_token: String,
+    member_name: String,
+) -> Result<JoinResult, Error> {
+    let member_name = MemberName::new(member_name)?;
+
+    // Lock order and guard lifetime: see `handle_join_room_token`. Holding the
+    // store read guard until registration also excludes a concurrent seat deletion
+    // (`DELMB`, the expired-seat sweep), which needs the store write lock.
+    let store_read = store.read().await;
     let (room_token, room_name) = {
-        let store_read = store.read().await;
         let (room, seat) = store_read
             .seat_for_token(&seat_token)
             .ok_or(Error::InvalidSeatToken)?;
@@ -124,6 +172,7 @@ pub async fn handle_join_seat(
     };
 
     let mut app_write = app.write().await;
+    trace!(room = %room_name, member = %member_name, "seat join holding store read + app write locks");
 
     match app_write.check_room_membership(&session_token, room_token.as_str()) {
         MembershipCheck::Superseded => return Err(Error::Superseded),
@@ -132,7 +181,7 @@ pub async fn handle_join_seat(
         MembershipCheck::NotMember => {}
     }
 
-    // Seat-token collision: unconditionally evict the existing holder's
+    // Seat-token collision: evict the existing holder's
     // membership in this room only, carrying over its still-valid, room-tagged
     // queued messages (ANTI-PATTERNS #11) into the caller's own shared inbox.
     let is_active = app_write
@@ -140,6 +189,27 @@ pub async fn handle_join_seat(
         .get(&room_token)
         .and_then(|rs| rs.members.get(&member_name))
         .is_some();
+    let now = Instant::now();
+    if is_active {
+        if let Some(remaining) =
+            app_write.seat_freeze_remaining(&room_token, &room_name, &member_name, now)
+        {
+            // Round up: a freeze with 0.4 s left must not tell the caller "0s".
+            let retry_after_secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            warn!(
+                room = %room_name,
+                member = %member_name,
+                session = %session_id(&session_token),
+                retry_after_secs,
+                "seat join rejected — seat frozen for credential contention; current holder kept"
+            );
+            return Err(Error::SeatContention {
+                room: room_name,
+                member: member_name.into_string(),
+                retry_after_secs,
+            });
+        }
+    }
     let carried = if is_active {
         let carried = app_write
             .evict_member_superseded(&room_token, &room_name, &member_name)
@@ -151,12 +221,24 @@ pub async fn handle_join_seat(
             carried = carried.len(),
             "prior room membership superseded by seat-holder join"
         );
+        if let FlapOutcome::Frozen { count, hold_down } =
+            app_write.record_seat_supersede(&room_token, &room_name, &member_name, now, policy)
+        {
+            // The joiner that tripped the threshold becomes the frozen holder.
+            info!(
+                room = %room_name,
+                member = %member_name,
+                session = %session_id(&session_token),
+                supersedes_in_window = count,
+                hold_down_secs = hold_down.as_secs(),
+                "seat frozen with this join's session as the holder"
+            );
+        }
         carried
     } else {
         Vec::new()
     };
 
-    let now = Instant::now();
     app_write.register_room_membership(
         room_token,
         member_name.clone(),
@@ -166,6 +248,7 @@ pub async fn handle_join_seat(
     );
     let inbox = app_write.session_inbox(&session_token);
     drop(app_write);
+    drop(store_read);
 
     if !carried.is_empty() {
         if let Some(inbox) = inbox {
@@ -181,6 +264,7 @@ pub async fn handle_join_seat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::mn;
     use crate::{
         rooms::RoomStore, state::AppState, test_support::TEST_MASTER_SECRET,
         tools::connect::handle_connect,
@@ -440,5 +524,335 @@ mod tests {
 
         let result = handle_join_seat(&app, &store, session, seat_token, "alice".into()).await;
         assert!(matches!(result.unwrap_err(), Error::AlreadyJoinedRoom(_)));
+    }
+
+    // ── Seat-contention flap detection (TDD 12.6, 12.7) ───────────────────────
+
+    /// Join the seat from a brand-new session (each thrashing agent reconnects
+    /// with a fresh session after being superseded out of its last room).
+    async fn seat_join_fresh(
+        app: &SharedAppState,
+        store: &Arc<RwLock<RoomStore>>,
+        policy: SeatFlapPolicy,
+        seat_token: &str,
+    ) -> (SessionToken, Result<JoinResult, Error>) {
+        let session = handle_connect(app, None).await.unwrap().session_token;
+        let result = handle_join_seat_with_policy(
+            app,
+            store,
+            policy,
+            session.clone(),
+            seat_token.to_string(),
+            "alice".into(),
+        )
+        .await;
+        (session, result)
+    }
+
+    fn holder_of(app: &AppState, room_token: &str) -> Option<SessionToken> {
+        app.rooms
+            .get(room_token)
+            .and_then(|rs| rs.members.get("alice"))
+            .map(|m| m.session_token.clone())
+    }
+
+    fn policy(threshold: u32, window_ms: u64, hold_down_ms: u64) -> SeatFlapPolicy {
+        SeatFlapPolicy {
+            threshold,
+            window: std::time::Duration::from_millis(window_ms),
+            hold_down: std::time::Duration::from_millis(hold_down_ms),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_seat_thrash_freezes_seat_and_keeps_holder() {
+        // Rubric 12.6: more than `threshold` supersessions inside the window
+        // freezes the seat; the next superseding join is rejected with
+        // SeatContention and the current holder keeps its membership.
+        let dir = TempDir::new().unwrap();
+        let (store, seat_token) = make_store_with_seat(&dir).await;
+        let room_token = store
+            .read()
+            .await
+            .get_by_name("testroom")
+            .unwrap()
+            .token
+            .to_string();
+        let app = AppState::new();
+        let p = policy(3, 60_000, 60_000);
+
+        // Initial claim (no supersede) + 4 supersessions: the 4th trips 4 > 3.
+        let mut last_holder = SessionToken::from(String::new());
+        for _ in 0..5 {
+            let (session, result) = seat_join_fresh(&app, &store, p, &seat_token).await;
+            result.expect("joins up to and including the tripping one succeed");
+            last_holder = session;
+        }
+        assert_eq!(
+            holder_of(&*app.read().await, &room_token),
+            Some(last_holder.clone())
+        );
+
+        let (_, result) = seat_join_fresh(&app, &store, p, &seat_token).await;
+        match result.unwrap_err() {
+            Error::SeatContention {
+                room,
+                member,
+                retry_after_secs,
+            } => {
+                assert_eq!(room, "testroom");
+                assert_eq!(member, "alice");
+                assert!((1..=60).contains(&retry_after_secs));
+            }
+            other => panic!("expected SeatContention, got {other:?}"),
+        }
+        // The livelock is broken with one winner: the holder was not evicted.
+        assert_eq!(
+            holder_of(&*app.read().await, &room_token),
+            Some(last_holder)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seat_freeze_lapses_after_hold_down() {
+        // Rubric 12.7: once the hold-down lapses, a superseding join is accepted
+        // again and counting restarts from zero.
+        let dir = TempDir::new().unwrap();
+        let (store, seat_token) = make_store_with_seat(&dir).await;
+        let app = AppState::new();
+        let p = policy(1, 60_000, 50);
+
+        for _ in 0..3 {
+            seat_join_fresh(&app, &store, p, &seat_token)
+                .await
+                .1
+                .unwrap();
+        }
+        let (_, frozen) = seat_join_fresh(&app, &store, p, &seat_token).await;
+        assert!(matches!(frozen.unwrap_err(), Error::SeatContention { .. }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let (session, result) = seat_join_fresh(&app, &store, p, &seat_token).await;
+        result.expect("freeze lapsed — superseding join must be accepted");
+        let room_token = store
+            .read()
+            .await
+            .get_by_name("testroom")
+            .unwrap()
+            .token
+            .to_string();
+        assert_eq!(holder_of(&*app.read().await, &room_token), Some(session));
+    }
+
+    #[tokio::test]
+    async fn test_seat_flap_detection_disabled_by_zero_threshold() {
+        // Rubric 12.6 (opt-out): threshold 0 never freezes.
+        let dir = TempDir::new().unwrap();
+        let (store, seat_token) = make_store_with_seat(&dir).await;
+        let app = AppState::new();
+        let p = policy(0, 60_000, 60_000);
+        for _ in 0..10 {
+            seat_join_fresh(&app, &store, p, &seat_token)
+                .await
+                .1
+                .unwrap();
+        }
+        assert!(app
+            .read()
+            .await
+            .seat_flaps
+            .values()
+            .all(|f| f.frozen_until.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_frozen_seat_without_holder_can_be_claimed() {
+        // Rubric 12.6: the freeze only blocks supersession — if the holder has
+        // left, the seat can be claimed without displacing anyone.
+        let dir = TempDir::new().unwrap();
+        let (store, seat_token) = make_store_with_seat(&dir).await;
+        let room_token = store
+            .read()
+            .await
+            .get_by_name("testroom")
+            .unwrap()
+            .token
+            .to_string();
+        let app = AppState::new();
+        let p = policy(1, 60_000, 60_000);
+        for _ in 0..3 {
+            seat_join_fresh(&app, &store, p, &seat_token)
+                .await
+                .1
+                .unwrap();
+        }
+        assert!(
+            app.write()
+                .await
+                .evict_member(&room_token, "testroom", &mn("alice"), "test: holder left")
+                .await
+        );
+        seat_join_fresh(&app, &store, p, &seat_token)
+            .await
+            .1
+            .expect("an unheld frozen seat must still be claimable");
+    }
+
+    #[tokio::test]
+    async fn test_operator_clear_unfreezes_seat() {
+        // Rubric 12.7: the operator clear (KCKM / DELMB path) drops the freeze.
+        let dir = TempDir::new().unwrap();
+        let (store, seat_token) = make_store_with_seat(&dir).await;
+        let room_token = store
+            .read()
+            .await
+            .get_by_name("testroom")
+            .unwrap()
+            .token
+            .to_string();
+        let app = AppState::new();
+        let p = policy(1, 60_000, 60_000);
+        for _ in 0..3 {
+            seat_join_fresh(&app, &store, p, &seat_token)
+                .await
+                .1
+                .unwrap();
+        }
+        assert!(app
+            .write()
+            .await
+            .clear_seat_flap(&room_token, &mn("alice"), Instant::now()));
+        seat_join_fresh(&app, &store, p, &seat_token)
+            .await
+            .1
+            .expect("cleared seat must accept a superseding join");
+    }
+
+    #[tokio::test]
+    async fn test_prune_drops_stale_flap_history_only() {
+        // Every piece of server data has a TTL: the sweep prunes a history that is
+        // neither frozen nor inside its window, and keeps a frozen one.
+        let app = AppState::new();
+        let mut a = app.write().await;
+        let now = Instant::now();
+        a.record_seat_supersede("rt", "room", &mn("stale"), now, policy(5, 10, 10));
+        a.record_seat_supersede("rt", "room", &mn("frozen"), now, policy(0, 10, 10));
+        a.record_seat_supersede("rt", "room", &mn("frozen"), now, policy(1, 10, 60_000));
+        let later = now + std::time::Duration::from_millis(100);
+        assert_eq!(a.prune_seat_flaps(later), 1);
+        assert!(a
+            .seat_flaps
+            .contains_key(&(RoomToken::from("rt".to_string()), mn("frozen"))));
+    }
+
+    // ── Join vs. concurrent delete ────────────────────────────────────────────
+
+    /// Spawn `join_fut`, let it run until it is parked on the AppState write lock
+    /// (held by the caller), then report whether a deletion's first step — taking
+    /// the RoomStore write lock — is excluded while the join is mid-flight.
+    async fn store_write_excluded_during_join(store: &Arc<RwLock<RoomStore>>) -> bool {
+        // Current-thread runtime: each yield lets the spawned join run until it
+        // blocks; it needs no more than one, the bound is just a safety margin.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if store.try_write().is_err() {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_room_token_join_excludes_concurrent_room_delete() {
+        // Rubric 1b.8: a room deletion can no longer slip in between join's
+        // credential check and its membership registration. With the AppState
+        // write lock held by the test, the join is parked exactly in that window;
+        // the deletion's store write must be excluded until the join finishes, so
+        // the deletion then evicts the new membership instead of leaving it
+        // attached to a room that no longer exists.
+        let dir = TempDir::new().unwrap();
+        let (store, room_token) = make_store_with_room(&dir).await;
+        let app = AppState::new();
+        let session = handle_connect(&app, None).await.unwrap().session_token;
+
+        let app_guard = app.write().await;
+        let join = tokio::spawn({
+            let (app, store, session, room_token) = (
+                app.clone(),
+                store.clone(),
+                session.clone(),
+                room_token.clone(),
+            );
+            async move {
+                handle_join_room_token(&app, &store, session, room_token, "alice".into()).await
+            }
+        });
+        assert!(
+            store_write_excluded_during_join(&store).await,
+            "a room delete must not be able to take the store write lock while a join \
+             that has verified the room token is still registering"
+        );
+        drop(app_guard);
+        join.await.unwrap().unwrap();
+
+        // The deletion now runs exactly as DELRM does: store first, then evict.
+        store.write().await.delete("testroom").await.unwrap();
+        app.write()
+            .await
+            .evict_room(&room_token, "testroom", "room deleted")
+            .await;
+        let a = app.read().await;
+        assert!(!a.rooms.contains_key(room_token.as_str()));
+        assert!(
+            !a.session_exists(&session),
+            "no membership may survive the delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seat_join_excludes_concurrent_seat_delete() {
+        // Rubric 1b.8, seat path: same window, with a seat deletion (DELMB).
+        let dir = TempDir::new().unwrap();
+        let (store, seat_token) = make_store_with_seat(&dir).await;
+        let room_token = store
+            .read()
+            .await
+            .get_by_name("testroom")
+            .unwrap()
+            .token
+            .clone();
+        let app = AppState::new();
+        let session = handle_connect(&app, None).await.unwrap().session_token;
+
+        let app_guard = app.write().await;
+        let join = tokio::spawn({
+            let (app, store, session, seat_token) = (
+                app.clone(),
+                store.clone(),
+                session.clone(),
+                seat_token.clone(),
+            );
+            async move { handle_join_seat(&app, &store, session, seat_token, "alice".into()).await }
+        });
+        assert!(
+            store_write_excluded_during_join(&store).await,
+            "a seat delete must not be able to take the store write lock while a seat join \
+             that has verified the seat token is still registering"
+        );
+        drop(app_guard);
+        join.await.unwrap().unwrap();
+
+        store
+            .write()
+            .await
+            .delete_seat("testroom", "alice")
+            .await
+            .unwrap();
+        app.write()
+            .await
+            .evict_member_superseded(&room_token, "testroom", &mn("alice"))
+            .await;
+        assert!(holder_of(&*app.read().await, room_token.as_str()).is_none());
+        assert!(!app.read().await.session_exists(&session));
     }
 }

@@ -93,8 +93,9 @@ pub struct JoinParams {
     pub session_token: String,
     /// Seat token from the 3-line ~/.toaster-talk/tokens/user/<room>/<member>.tok file.
     /// Preferred over room_token when present — authorises this member specifically,
-    /// and unconditionally evicts (and supersedes) any other session currently
-    /// holding this room/member. Exactly one of seat_token or room_token must be
+    /// and evicts (and supersedes) any other session currently holding this
+    /// room/member, unless the seat is frozen for credential contention
+    /// (`SeatContention`). Exactly one of seat_token or room_token must be
     /// provided.
     pub seat_token: Option<String>,
     /// Room token from the 2-line ~/.toaster-talk/tokens/<room>.tok file.
@@ -145,8 +146,8 @@ pub struct ReceiveParams {
     pub timeout_secs: Option<u64>,
     /// Restrict this receive to messages from one specific room (name, not
     /// token) your session has joined. Omit to block until a message arrives
-    /// from ANY of your joined rooms and drain all of them in one batch — each
-    /// returned message reports which room it came from. Supplying a room only
+    /// from ANY of your joined rooms and drain the oldest of them (up to the
+    /// server's batch size) — each returned message reports which room it came from. Supplying a room only
     /// drains that room's messages, leaving other rooms' messages queued for a
     /// later call.
     pub room: Option<String>,
@@ -185,13 +186,14 @@ impl ToasterServer {
         description = "Mint a ToasterTalk session token — identity only, never a room membership. Call this once per agent process; every room you join (your very first included) happens afterward via `join`, not here. Omit old_session_token on your first connect. Only pass old_session_token if you are deliberately rotating a still-live session token (e.g. you suspect it leaked) — doing so invalidates that session AND every room membership under it immediately with no carryover; you must `join` each room again afterward using the room/seat token you still hold. Returns a session_token — treat it as credential-grade for as long as it lives: it now grants access to every room your session joins, not just one, so never log it in full or paste it insecurely."
     )]
     async fn connect(&self, p: Parameters<ConnectParams>) -> Result<CallToolResult, rmcp::Error> {
-        let result = match connect::handle_connect(&self.app, p.0.old_session_token).await {
-            Ok(r) => {
-                let body = format!("session_token: {}\n", r.session_token);
-                CallToolResult::success(vec![Content::text(body)])
-            }
-            Err(e) => tool_error(e.to_string()),
-        };
+        let result =
+            match connect::handle_connect(&self.app, p.0.old_session_token.map(Into::into)).await {
+                Ok(r) => {
+                    let body = format!("session_token: {}\n", r.session_token.as_str());
+                    CallToolResult::success(vec![Content::text(body)])
+                }
+                Err(e) => tool_error(e.to_string()),
+            };
         Ok(result)
     }
 
@@ -200,15 +202,17 @@ impl ToasterServer {
     /// Requires a valid `session_token` from `connect`, plus a room or seat
     /// token and the member name to use in that room.
     #[tool(
-        description = "Join a room, attaching a room membership to your existing session_token (from connect). This is the only way any room membership is ever created — including your very first room. Requires a valid session_token (a missing/invalid one is a hard error — join never silently mints a session). Token files live in your home directory's `.toaster-talk/tokens` folder — `~/.toaster-talk/tokens` on Unix/macOS, `%USERPROFILE%\\.toaster-talk\\tokens` on Windows. First scan the `tokens/user/` subtree recursively (seat files live in per-room subdirectories, e.g. tokens/user/<room>/<member>.tok) for a 3-line seat token file whose first line matches the room name — if found, pass seat_token (line 3) and member_name (line 2). Otherwise scan `tokens/` for a 2-line room token file and pass room_token (line 2) with your assigned member_name. Exactly one of seat_token or room_token must be provided. A room-token join fails with MemberNameTaken if a different session already holds that name in the room (fatal — do not retry with a different name; surface it to the operator). A seat-token join unconditionally evicts and supersedes any other session currently holding that seat's room/member. Joining a room your own session already belongs to is rejected as redundant, not a silent no-op."
+        description = "Join a room, attaching a room membership to your existing session_token (from connect). This is the only way any room membership is ever created — including your very first room. Requires a valid session_token (a missing/invalid one is a hard error — join never silently mints a session). Token files live in your home directory's `.toaster-talk/tokens` folder — `~/.toaster-talk/tokens` on Unix/macOS, `%USERPROFILE%\\.toaster-talk\\tokens` on Windows. First scan the `tokens/user/` subtree recursively (seat files live in per-room subdirectories, e.g. tokens/user/<room>/<member>.tok) for a 3-line seat token file whose first line matches the room name — if found, pass seat_token (line 3) and member_name (line 2). Otherwise scan `tokens/` for a 2-line room token file and pass room_token (line 2) with your assigned member_name. Exactly one of seat_token or room_token must be provided. A room-token join fails with MemberNameTaken if a different session already holds that name in the room (fatal — do not retry with a different name; surface it to the operator). A seat-token join evicts and supersedes any other session currently holding that seat's room/member — unless the seat has been superseded repeatedly within a short window, in which case it is frozen and the join fails with SeatContention (two live agents are sharing one seat token; the current holder keeps the seat). SeatContention is not a retry signal: do not retry in a loop and do not join under a different name — surface it to the operator. Joining a room your own session already belongs to is rejected as redundant, not a silent no-op."
     )]
     async fn join(&self, p: Parameters<JoinParams>) -> Result<CallToolResult, rmcp::Error> {
         let result = match (p.0.seat_token, p.0.room_token) {
             (Some(seat_token), _) => {
-                match join::handle_join_seat(
+                let policy = crate::state::SeatFlapPolicy::from_config(&self.config.load());
+                match join::handle_join_seat_with_policy(
                     &self.app,
                     &self.store,
-                    p.0.session_token,
+                    policy,
+                    p.0.session_token.into(),
                     seat_token,
                     p.0.member_name,
                 )
@@ -225,7 +229,7 @@ impl ToasterServer {
                 match join::handle_join_room_token(
                     &self.app,
                     &self.store,
-                    p.0.session_token,
+                    p.0.session_token.into(),
                     room_token,
                     p.0.member_name,
                 )
@@ -253,7 +257,7 @@ impl ToasterServer {
     /// only via `receive`. Set await_reply_secs to block until the recipient
     /// replies or the timeout elapses.
     #[tool(
-        description = "Send a message to another member in a room your session has joined. room_name is required — pass the room to send in, since your session may belong to more than one. Fire-and-forget (no await_reply_secs) returns immediately and is strictly one-way — it never returns messages from your own inbox; to read your mail, call receive. Set await_reply_secs to a large value (e.g. 3600) when genuinely awaiting a reply — this is the promise/await pattern; only a reply from THIS room's recipient satisfies the wait, even if your session has other rooms with traffic of their own. Only use a small await_reply_secs (e.g. 5) for an opportunistic poll where you are not actually expecting a reply. The response `timeout` field reports the reply wait: `none` = a reply was returned, `elapsed` = the wait expired with no reply, `capped` = an MCP-host time limit (X-Host-Cap-Secs) cut the wait short, `preempted` = a newer blocking call of yours (a receive, or another send-with-reply) took over your inbox's single receive slot and aborted this wait (empty result, nothing lost — do not run blocking calls concurrently). CRITICAL: on `capped` your message has ALREADY been delivered — do NOT call send again to keep waiting (that delivers a duplicate). Instead call receive to continue awaiting the reply. On `preempted` your message was also already delivered; just let your other call await the reply. INBOX HYGIENE: if you have done significant work since your last inbox check, first call receive with timeout_secs: 3 so this message accounts for anything that arrived in the meantime. A returned message that carries `reply_expected_within_secs` means its sender is awaiting your reply within that many seconds — reply promptly with a `send` back to its `from`."
+        description = "Send a message to another member in a room your session has joined. room_name is required — pass the room to send in, since your session may belong to more than one. Fire-and-forget (no await_reply_secs) returns immediately and is strictly one-way — it never returns messages from your own inbox; to read your mail, call receive. Set await_reply_secs to a large value (e.g. 3600) when genuinely awaiting a reply — this is the promise/await pattern; only a reply from THIS room's recipient satisfies the wait, even if your session has other rooms with traffic of their own. The reply drain returns at most the same server-configured batch size as receive; if the response carries a non-zero `remaining`, more messages from this room (possibly including the reply) are still queued — call receive with this room to collect them. Only use a small await_reply_secs (e.g. 5) for an opportunistic poll where you are not actually expecting a reply. The response `timeout` field reports the reply wait: `none` = a reply was returned, `elapsed` = the wait expired with no reply, `capped` = an MCP-host time limit (X-Host-Cap-Secs) cut the wait short, `preempted` = a newer blocking call of yours (a receive, or another send-with-reply) took over your inbox's single receive slot and aborted this wait (empty result, nothing lost — do not run blocking calls concurrently). CRITICAL: on `capped` your message has ALREADY been delivered — do NOT call send again to keep waiting (that delivers a duplicate). Instead call receive to continue awaiting the reply. On `preempted` your message was also already delivered; just let your other call await the reply. INBOX HYGIENE: if you have done significant work since your last inbox check, first call receive with timeout_secs: 3 so this message accounts for anything that arrived in the meantime. A returned message that carries `reply_expected_within_secs` means its sender is awaiting your reply within that many seconds — reply promptly with a `send` back to its `from`."
     )]
     pub async fn send(&self, p: Parameters<SendParams>) -> Result<CallToolResult, rmcp::Error> {
         let host_cap_secs = host_cap::REQUEST_HOST_CAP.try_with(|v| *v).ok().flatten();
@@ -265,7 +269,7 @@ impl ToasterServer {
             &self.app,
             &config,
             &self.store,
-            p.0.session_token,
+            p.0.session_token.into(),
             p.0.room_name,
             p.0.to,
             p.0.message,
@@ -283,6 +287,9 @@ impl ToasterServer {
                 if r.timeout != Timeout::None {
                     out.push_str(&format!("timeout: {}\n", r.timeout));
                 }
+                if r.remaining > 0 {
+                    out.push_str(&format!("remaining: {}\n", r.remaining));
+                }
                 if !r.messages.is_empty() {
                     out.push_str(&tools::format_messages_yaml(&r.messages));
                 }
@@ -296,9 +303,10 @@ impl ToasterServer {
     /// Wait for incoming messages.
     ///
     /// Blocks until at least one message arrives or timeout_secs elapses.
-    /// All queued messages are returned in a single batch in enqueue order.
+    /// Queued messages are returned in enqueue order, at most `max_receive_batch`
+    /// per call; the response's `remaining` counts what is still queued.
     #[tool(
-        description = "Wait for incoming messages. Blocks until messages arrive or timeout_secs elapses, then returns all queued messages in order. Omit `room` (the default) to wait across every room your session has joined — each returned message reports its `room` so you know where it came from. Pass `room` to wait for (and drain) only that one room's messages, leaving other rooms' messages queued for a later call. Use a large timeout (e.g. 3600) when genuinely awaiting a message — this is the promise/await pattern and avoids wasteful polling. Use a small timeout (e.g. 5) only when polling opportunistically. The response `timeout` field reports the wait: `none` = messages were returned, `elapsed` = the wait expired with no messages, `capped` = an MCP-host time limit (X-Host-Cap-Secs) cut the wait short. On `capped`, simply call receive again to keep waiting — re-polling is safe and never duplicates messages. IMPORTANT: never run two receives (or a receive and a send-with-reply) at the same time — one receive already drains every queued message in a single batch, so a second concurrent call is pointless AND preempts the first: the preempted call returns `timeout: preempted` with an empty batch. That is NOT an empty inbox (`elapsed`) and NOT a delivery (`none`) — nothing was lost, your other call now owns the wait; do not act on it as a result. A delivered message that carries `reply_expected_within_secs` means its sender is awaiting your reply within that many seconds — reply promptly with a `send` back to its `from`."
+        description = "Wait for incoming messages. Blocks until messages arrive or timeout_secs elapses, then returns queued messages oldest-first, at most a server-configured batch size per call (default 16). The response `remaining` field counts further messages still queued for the same scope — if it is non-zero, call receive again right away (it returns immediately, without waiting) to collect the next batch; nothing beyond the batch is lost or reordered. Omit `room` (the default) to wait across every room your session has joined — each returned message reports its `room` so you know where it came from. Pass `room` to wait for (and drain) only that one room's messages, leaving other rooms' messages queued for a later call. Use a large timeout (e.g. 3600) when genuinely awaiting a message — this is the promise/await pattern and avoids wasteful polling. Use a small timeout (e.g. 5) only when polling opportunistically. The response `timeout` field reports the wait: `none` = messages were returned, `elapsed` = the wait expired with no messages, `capped` = an MCP-host time limit (X-Host-Cap-Secs) cut the wait short. On `capped`, simply call receive again to keep waiting — re-polling is safe and never duplicates messages. IMPORTANT: never run two receives (or a receive and a send-with-reply) at the same time — a second concurrent call gains nothing (drain the backlog with sequential receives instead) AND preempts the first: the preempted call returns `timeout: preempted` with an empty batch. That is NOT an empty inbox (`elapsed`) and NOT a delivery (`none`) — nothing was lost, your other call now owns the wait; do not act on it as a result. A delivered message that carries `reply_expected_within_secs` means its sender is awaiting your reply within that many seconds — reply promptly with a `send` back to its `from`."
     )]
     pub async fn receive(
         &self,
@@ -313,15 +321,16 @@ impl ToasterServer {
         let result = match receive::handle_receive(
             &self.app,
             &self.store,
-            p.0.session_token,
+            p.0.session_token.into(),
             timeout_secs,
             host_cap_secs,
             p.0.room,
+            config.max_receive_batch,
         )
         .await
         {
             Ok(r) => {
-                let mut out = format!("timeout: {}\n", r.timeout);
+                let mut out = format!("timeout: {}\nremaining: {}\n", r.timeout, r.remaining);
                 if r.messages.is_empty() {
                     out.push_str("messages: []\n");
                 } else {
@@ -345,28 +354,32 @@ impl ToasterServer {
         &self,
         p: Parameters<MembersParams>,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let result =
-            match roster::handle_members(&self.app, &self.store, p.0.session_token, p.0.room_name)
-                .await
-            {
-                Ok(r) => {
-                    let mut out = format!(
-                        "room: \"{}\"\nmember_count: {}\n",
-                        r.room_name,
-                        r.members.len()
-                    );
-                    if r.members.is_empty() {
-                        out.push_str("members: []\n");
-                    } else {
-                        out.push_str("members:\n");
-                        for m in &r.members {
-                            out.push_str(&format!("  - {m}\n"));
-                        }
+        let result = match roster::handle_members(
+            &self.app,
+            &self.store,
+            p.0.session_token.into(),
+            p.0.room_name,
+        )
+        .await
+        {
+            Ok(r) => {
+                let mut out = format!(
+                    "room: \"{}\"\nmember_count: {}\n",
+                    r.room_name,
+                    r.members.len()
+                );
+                if r.members.is_empty() {
+                    out.push_str("members: []\n");
+                } else {
+                    out.push_str("members:\n");
+                    for m in &r.members {
+                        out.push_str(&format!("  - {m}\n"));
                     }
-                    CallToolResult::success(vec![Content::text(out)])
                 }
-                Err(e) => tool_error(e.to_string()),
-            };
+                CallToolResult::success(vec![Content::text(out)])
+            }
+            Err(e) => tool_error(e.to_string()),
+        };
         Ok(result)
     }
 
@@ -380,19 +393,23 @@ impl ToasterServer {
         description = "Leave a room — the inverse of `join`. Removes only your membership in the named room_name; you must name a room your session has joined. If your session belongs to other rooms, they and your shared inbox are completely unaffected. If this was your session's only remaining room membership, the whole session (and its shared inbox) is torn down — to use ToasterTalk again afterward, call `connect` and `join` fresh. Leaving does not delete or revoke a seat credential: a seat holder can `join` the same room again later with the same seat token. Returns the room name and member name that left."
     )]
     pub async fn leave(&self, p: Parameters<LeaveParams>) -> Result<CallToolResult, rmcp::Error> {
-        let result =
-            match leave::handle_leave(&self.app, &self.store, p.0.session_token, p.0.room_name)
-                .await
-            {
-                Ok(r) => {
-                    let body = format!(
-                        "room: \"{}\"\nmember_name: \"{}\"\n",
-                        r.room_name, r.member_name
-                    );
-                    CallToolResult::success(vec![Content::text(body)])
-                }
-                Err(e) => tool_error(e.to_string()),
-            };
+        let result = match leave::handle_leave(
+            &self.app,
+            &self.store,
+            p.0.session_token.into(),
+            p.0.room_name,
+        )
+        .await
+        {
+            Ok(r) => {
+                let body = format!(
+                    "room: \"{}\"\nmember_name: \"{}\"\n",
+                    r.room_name, r.member_name
+                );
+                CallToolResult::success(vec![Content::text(body)])
+            }
+            Err(e) => tool_error(e.to_string()),
+        };
         Ok(result)
     }
 }
@@ -429,8 +446,11 @@ impl ServerHandler for ToasterServer {
                  re-join a room you already hold. Repeat join once per additional room you need. \
                  Step 3 — send and receive: both now take/report a room. send requires room_name \
                  (which room to send in); receive's room field is optional — omit it to drain \
-                 messages from every room you've joined in one batch (each tagged with its room), \
-                 or pass one room name to drain only that room, leaving the rest queued. \
+                 messages from every room you've joined (each tagged with its room), or pass one \
+                 room name to drain only that room, leaving the rest queued. Each receive returns \
+                 at most a server-configured batch (default 16), oldest first; a non-zero \
+                 `remaining` in the response means more is queued — call receive again \
+                 promptly (it returns immediately) until `remaining` is 0. \
                  INBOX HYGIENE — when you perform significant work between turns in a dialogue \
                  (after any send, whether fire-and-forget or with await_reply_secs), poll your \
                  inbox with a short receive (timeout_secs: 3) to catch messages that arrived \
@@ -446,7 +466,7 @@ impl ServerHandler for ToasterServer {
                  continue by calling receive — never call send again to resume a capped reply \
                  wait: your message was already delivered, and resending would deliver a duplicate. \
                  Never issue two blocking calls (receive and/or send-with-reply) concurrently: one \
-                 receive drains the whole batch, and a second concurrent call only preempts the \
+                 receive owns the inbox at a time, and a second concurrent call only preempts the \
                  first (`preempted`) without gaining anything. Treat session_token as \
                  credential-grade: a leak now exposes every room your session belongs to, not \
                  just one — never log it in full or paste it insecurely."

@@ -63,7 +63,7 @@ one of `seat_token` / `room_token` must be supplied.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `session_token` | `string` | yes | From `connect`. Missing/unrecognized is a hard `InvalidSessionToken` — `join` never silently mints a session. |
-| `seat_token` | `string` | one-of | Line 3 of a 3-line seat token file. Authorises this member specifically; unconditionally evicts (and supersedes) any other session currently holding this room/member. |
+| `seat_token` | `string` | one-of | Line 3 of a 3-line seat token file. Authorises this member specifically; evicts (and supersedes) any other session currently holding this room/member — unless the seat is frozen for credential contention (`SeatContention`, below). |
 | `room_token` | `string` | one-of | Line 2 of a 2-line room token file. Shared-access credential. Never supersedes another session — a name collision is rejected outright (see Errors). |
 | `member_name` | `string` | yes | 1–40 chars, `[a-zA-Z0-9_-]`. The name this agent takes in *this* room (may differ from names used in the session's other rooms). |
 
@@ -78,7 +78,29 @@ Errors: `InvalidSessionToken` (missing/unrecognized `session_token`),
 **fatal, non-retryable**, no `old_session_token` escape hatch on `join`),
 `AlreadyJoinedRoom` (the caller's own session already belongs to this room —
 rejected as redundant, not a no-op), invalid/expired room or seat token,
-`RoomExpired`.
+`RoomExpired`, `SeatContention` (seat-token path only — see below).
+
+A join whose room (or, for a seat join, seat) is deleted concurrently gets exactly
+what a join against the already-deleted credential gets — `invalid room token` /
+`invalid or expired seat token` — or, if the join registered first, the deletion
+evicts the new membership. It never leaves a membership attached to a room or seat
+that no longer exists in the store.
+
+**`SeatContention`** — the seat (room + member) has been superseded more than
+`[rooms].seat_flap_threshold` times within `seat_flap_window_secs`, which means two
+live agents are sharing one seat token. The seat is frozen for
+`seat_flap_hold_down_secs`: a seat-token `join` that would supersede the current
+holder is rejected with this error and the holder keeps its membership. A frozen
+seat with **no** current holder can still be claimed (the freeze blocks
+supersession only). Message: `seat '<member>' in room '<room>' is frozen for another
+<n>s: seat credential contention detected …` — `<n>` is the remaining hold-down,
+rounded up. Agents must treat it as non-retryable: do not retry in a loop and do not
+join under another name; surface it to the operator. The freeze ends when the
+hold-down lapses (history reset, counting restarts at zero) or when the operator
+runs `KCKM` for that member (the documented clear), `KCKALL` for the room, or
+`DELMB` for the seat; deleting or expiring the room clears it too. The supersession
+that trips the threshold is itself accepted, so its joiner becomes the frozen
+holder.
 
 ### `leave`
 
@@ -129,7 +151,8 @@ unless `await_reply_secs` is set.
 | `ttl_secs` | `u64` | no | **Effective** TTL applied. When `await_reply_secs` is set this is `await_reply_secs + ttl_secs` (so the message cannot expire before the reply window closes). |
 | `last_seen` | `string` | yes | Human-readable idle duration (e.g. `"4 hours ago"`), present only when the recipient has not been seen within `idle_threshold_secs`. |
 | `timeout` | `"none" \| "elapsed" \| "capped" \| "preempted"` | yes | Present only when `await_reply_secs` was set. `none` = a reply was returned; `elapsed` = the wait expired with no reply; `capped` = an `X-Host-Cap-Secs` host limit cut the wait short (message already delivered — continue with `receive`, never re-`send`); `preempted` = a newer blocking call from the same member claimed the inbox's single receive slot and aborted this wait (nothing delivered, nothing lost — the newer call owns the wait now; almost always means concurrent blocking calls were issued). |
-| `messages` | *message[]* | yes | The reply(ies) delivered during a send-with-reply wait. **Only** a send-with-reply ever populates this — fire-and-forget is strictly one-way and never returns inbox messages (rubric 2.3). See [Message object](#message-object). |
+| `remaining` | `int` | yes | Present only when a send-with-reply drain left more messages from `room_name` queued because it hit `max_receive_batch` (same cap as `receive`). The awaited reply may be among them — continue with `receive` (`room: room_name`), never re-`send`. Omitted when `0` and always for fire-and-forget. |
+| `messages` | *message[]* | yes | The reply(ies) delivered during a send-with-reply wait (oldest first, at most `max_receive_batch`). **Only** a send-with-reply ever populates this — fire-and-forget is strictly one-way and never returns inbox messages (rubric 2.3). See [Message object](#message-object). |
 
 Errors: `RoomNotFound` (unknown `room_name`), `NotConnectedToRoom` (the session
 has not joined `room_name`), `RecipientEvicted` (recipient gone at enqueue or
@@ -145,14 +168,15 @@ Block until at least one matching message arrives or the timeout elapses.
 |-------|------|----------|-------------|
 | `session_token` | `string` | yes | From `connect`. |
 | `timeout_secs` | `u64` | no | Max block. Default `default_receive_timeout_secs` (30). Clamped to `max_receive_timeout_secs`. |
-| `room` | `string` | no | Restrict this receive to one specific room (name, not token) the session has joined. Omitted (default): blocks until a message from *any* joined room arrives and drains all of them in one batch — each message reports its own `room`. Supplied: blocks and drains only that room's messages, leaving the session's other rooms' messages queued for a later call. |
+| `room` | `string` | no | Restrict this receive to one specific room (name, not token) the session has joined. Omitted (default): blocks until a message from *any* joined room arrives and drains the oldest of them (up to `max_receive_batch`) — each message reports its own `room`. Supplied: blocks and drains only that room's messages (the cap applies to the filtered drain), leaving the session's other rooms' messages queued for a later call. |
 
 **Response:**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `timeout` | `"none" \| "elapsed" \| "capped" \| "preempted"` | Always present. `none` = messages returned; `elapsed` = wait expired empty; `capped` = host limit cut it short (call `receive` again); `preempted` = a newer blocking call from the same member took over the inbox's single receive slot and aborted this one (empty result, nothing lost — do not treat as a delivery; you issued concurrent receives). |
-| `messages` | *message[]* | All matching queued messages in enqueue order, or `[]`. See [Message object](#message-object). |
+| `remaining` | `int` | Always present. Number of still-valid messages matching this call's scope (the `room` filter, or every room when omitted) left queued because the batch hit `max_receive_batch`. `0` on `elapsed` / `capped` / `preempted`, and when the batch emptied the scope. Non-zero ⇒ call `receive` again with the same scope: the remainder is already queued, so that call returns immediately with the next batch, in order. Messages from rooms outside a supplied `room` filter are never counted. |
+| `messages` | *message[]* | The oldest matching queued messages in enqueue order, at most `max_receive_batch` of them, or `[]`. See [Message object](#message-object). |
 
 Errors: `RoomNotFound` (unknown `room` name), `NotConnectedToRoom` (the session
 has not joined `room`), `NotJoinedAnyRoom` (`room` omitted and the session
@@ -192,6 +216,7 @@ by `format_messages_yaml` from an `InboxMessage`.
 **Example** (a received send-with-reply message):
 ```yaml
 timeout: none
+remaining: 0
 messages:
   - id: c012f865-aa56-4d2c-b6ea-cd30f51bdb22
     from: grok
@@ -229,7 +254,8 @@ double-quoted for structural clarity.
 
 | Command | Request | Success response |
 |---------|---------|------------------|
-| `ADDRM` | `ADDRM "<name>" ["<name>" ...] [TTL <days>]` | `+ROOM_CREATED "<name>" <token> <expires_unix>` |
+| `ADDRM` | `ADDRM "<name>" ["<name>" ...] [TTL <days>]` | `+ROOM_CREATED "<name>" <token> <expires_unix>`; an existing name fails with `-ROOM_EXISTS "<name>" <text>` |
+| `ADDRM_FORCE` | `ADDRM_FORCE "<name>" ["<name>" ...] [TTL <days>]` | as `ADDRM`; a replaced room's line ends ` replaced evicted:<count>` |
 | `DELRM` | `DELRM "<name>" ["<name>" ...]` | `+ROOM_DELETED "<name>" evicted:<count>` |
 | `LSRM` | `LSRM` | `*<n>` then `<name> created:<ts> expires:<ts> members:<n>` per room |
 | `GTRM` | `GTRM "<name>"` | `+ROOM "<name>" created:<ts> expires:<ts> members:<n>` then one member name per line |
@@ -239,9 +265,9 @@ double-quoted for structural clarity.
 | `DELMB` | `DELMB "<room>" "<member>" ["<member>" ...]` | `+SEAT_DELETED "<room>" "<member>"` |
 | `LSMB` | `LSMB "<room>"` | `*<n>` then `"<member>" created:<ts> expires:<ts>` per seat |
 | `RELOAD` | `RELOAD` | `+RELOADED` once the reload has actually been applied (TDD 8.17) |
-| `DUMP` | `DUMP` | `+DUMP` then a redacted YAML body — the live in-memory snapshot (see `TECH.md` and TDD §13) |
+| `DUMP` | `DUMP` | `+DUMP` then a redacted YAML body — the live in-memory snapshot (see `TECH.md` and TDD §13; seat-contention fields below) |
 
-**Batch commands.** `ADDRM`, `DELRM`, `KCKALL`, `ADDMB` and `DELMB` accept several
+**Batch commands.** `ADDRM`, `ADDRM_FORCE`, `DELRM`, `KCKALL`, `ADDMB` and `DELMB` accept several
 names in one request (`KCKM` already does). The response is one line per distinct
 name, in request order, each either that command's usual `+...` success line (the
 table above) or `-<message>`; with more than one name a failure line reads
@@ -250,8 +276,38 @@ Items are independent — there is no all-or-nothing rollback — and the CLI ex
 non-zero if any line is a `-`. A trailing `TTL <days>` applies to every name and is
 recognised only after at least one name (so a lone item called `ttl` is a name; a
 batch whose *last* name is `ttl` is read as a TTL with no value and refused). An
-over-cap `TTL` refuses the whole `ADDRM` before anything is created. For `DELMB`
+over-cap `TTL` refuses the whole `ADDRM`/`ADDRM_FORCE` before anything is created. For `DELMB`
 an unknown room fails the whole command; for `KCKALL`/`DELRM` it fails that item.
+
+`KCKM` additionally clears any seat-contention freeze and supersession history for
+each named member (logged at INFO when a live freeze was cleared); `KCKALL` does
+the same for every seat in the room, and `DELMB` for the deleted seat. Response
+lines are unchanged.
+
+**`DUMP` seat-contention fields.** Every member row whose `auth_method` is
+`"seat"` carries three extra keys (room-token rows do not):
+
+| Key | Value |
+|-----|-------|
+| `recent_supersedes` | Supersessions of this seat inside the detection window right now (integer). |
+| `last_supersede_secs_ago` | Seconds since the most recent supersession, or `"never"`. |
+| `seat_frozen_secs_remaining` | Seconds left on a contention freeze (rounded up), or `"no"` when not frozen. |
+
+**Existing rooms: `ADDRM` refuses, `ADDRM_FORCE` overwrites.** A room token is
+derived from the room name, so re-creating a live room would land on the same token
+and replace it. `ADDRM` therefore never replaces: an item naming an existing room
+fails with `ROOM_EXISTS "<name>" <human text>` (so `-ROOM_EXISTS "<name>" ...` alone,
+or `-<name>: ROOM_EXISTS "<name>" ...` in a batch) and that room is left untouched —
+seats, timestamps and members intact. The `ROOM_EXISTS "` marker is the stable,
+machine-matchable part; the trailing text is advisory. `ADDRM_FORCE` takes the same
+arguments and replaces any existing room: same token, no seats, fresh created/expiry
+timestamps, and every live member of it evicted through the same path as `DELRM`;
+its success line gains a trailing ` replaced evicted:<count>` (absent when the name
+was new, so a parser that reads only the first four fields still works). Replacing
+does not count against `max_rooms`. Overwrite is a separate verb rather than an
+in-band keyword because any keyword is also a legal room name. The CLI sends
+`ADDRM`, and sends `ADDRM_FORCE` for exactly the names the operator confirmed (or all
+names, with `--force`).
 
 `RELOAD` triggers the same config + room-store reload as Unix's `SIGHUP` (see
 `[messages]`/`[rooms]` Reload column below) through this connection instead of an
@@ -344,6 +400,9 @@ change: *live* = takes effect on the next tool call / sweep / mgmt connection;
 | `max_rooms` (`TOASTER_MAX_ROOMS`) | `usize` | `50` | live | Hard ceiling on active rooms. |
 | `default_ttl_days` (`TOASTER_DEFAULT_ROOM_TTL_DAYS`) | `u64` | `30` | live | Default room TTL. |
 | `max_ttl_days` (`TOASTER_MAX_ROOM_TTL_DAYS`) | `u64` | `365` | live | Hard ceiling on room TTL (1 year). |
+| `seat_flap_threshold` (`TOASTER_SEAT_FLAP_THRESHOLD`) | `u32` | `3` | live | Seat-contention flap detection: a seat superseded **more than** this many times within `seat_flap_window_secs` is frozen (see `SeatContention`). `0` disables detection. Bounded `0..=1000`; out of range is a config error, never clamped. |
+| `seat_flap_window_secs` (`TOASTER_SEAT_FLAP_WINDOW_SECS`) | `u64` | `30` | live | Sliding window over which supersessions are counted. Bounded `1..=3600`. |
+| `seat_flap_hold_down_secs` (`TOASTER_SEAT_FLAP_HOLD_DOWN_SECS`) | `u64` | `60` | live | How long a contended seat stays frozen. Bounded `1..=86400`. |
 
 \* `store_path` — the *path* is restart-only (it cannot be repointed to a different file
 in-process), but the room store's **contents** at that path are re-read on every
@@ -367,6 +426,7 @@ as a malformed `config.toml` edit.
 | `max_await_reply_secs` (`TOASTER_MAX_AWAIT_REPLY_SECS`) | `u64` | `3600` | live | Hard ceiling on `send` `await_reply_secs`. |
 | `max_receive_timeout_secs` (`TOASTER_MAX_RECEIVE_TIMEOUT_SECS`) | `u64` | `3600` | live | Hard ceiling on `receive` `timeout_secs`. |
 | `max_inbox_messages` (`TOASTER_MAX_INBOX_MESSAGES`) | `usize` | `100` | live | Per-member inbox cap; a `send` that would exceed it is rejected (`InboxFull`). |
+| `max_receive_batch` (`TOASTER_MAX_RECEIVE_BATCH`) | `usize` | `16` | live | Most messages one `receive` call — or one send-with-reply reply drain — returns. Further matching messages stay queued in order and are reported in the response's `remaining`. Must be `1..=1000`; `0` or `> 1000` is a fatal config error (a reload with a bad value keeps the running config). A fixed bound rather than `max_inbox_messages`, so lowering the inbox cap never invalidates the batch setting; a value above the inbox cap is accepted and simply never reached. No CLI flag (like the other `[messages]` knobs: file → env). |
 
 `master_secret` is restart-only by necessity: rotating it in-process would invalidate
 every live session and seat token. (Test builds also honour an inline

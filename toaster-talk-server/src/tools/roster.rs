@@ -1,4 +1,9 @@
-use crate::{error::Error, rooms::RoomStore, state::SharedAppState, tools::session_id};
+use crate::{
+    error::Error,
+    rooms::RoomStore,
+    state::{MemberName, SessionToken, SharedAppState},
+    tools::session_id,
+};
 use std::{sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::info;
@@ -8,7 +13,7 @@ pub struct RosterResult {
     /// The authoritative room name (taken from the store, not from caller input).
     pub room_name: String,
     /// Member names currently registered in the room, sorted for stable output.
-    pub members: Vec<String>,
+    pub members: Vec<MemberName>,
 }
 
 /// List the members of a room the caller's session belongs to (TDD 5.3).
@@ -21,7 +26,7 @@ pub struct RosterResult {
 pub async fn handle_members(
     app: &SharedAppState,
     store: &Arc<RwLock<RoomStore>>,
-    session_token: String,
+    session_token: SessionToken,
     room_name: String,
 ) -> Result<RosterResult, Error> {
     // Resolve the room name to its token up front (rubric: an unknown room name
@@ -49,7 +54,7 @@ pub async fn handle_members(
             me.last_seen = Instant::now();
         }
 
-        let members: Vec<String> = room_state.members.keys().cloned().collect();
+        let members: Vec<MemberName> = room_state.members.keys().cloned().collect();
         members
     }; // app lock released
 
@@ -76,7 +81,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    async fn setup(dir: &TempDir) -> (SharedAppState, Arc<RwLock<RoomStore>>, String) {
+    async fn setup(dir: &TempDir) -> (SharedAppState, Arc<RwLock<RoomStore>>, SessionToken) {
         let store_path = dir.path().join("rooms.yaml");
         let mut store = RoomStore::load(store_path).unwrap();
         let room = store

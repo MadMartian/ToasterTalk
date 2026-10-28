@@ -116,6 +116,9 @@ store_path       = '$ConfigDir\rooms.yaml'
 max_rooms        = 50
 default_ttl_days = 30
 max_ttl_days     = 365
+seat_flap_threshold      = 3
+seat_flap_window_secs    = 30
+seat_flap_hold_down_secs = 60
 
 [messages]
 default_ttl_secs             = 660
@@ -128,6 +131,7 @@ default_receive_timeout_secs = 30
 max_await_reply_secs         = 3600
 max_receive_timeout_secs     = 3600
 max_inbox_messages           = 100
+max_receive_batch            = 16
 "@
         Set-Content -Path $configPath -Value $config -Encoding ascii
         Write-Host "Default config written to $configPath"

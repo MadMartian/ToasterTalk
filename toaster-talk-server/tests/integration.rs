@@ -61,7 +61,7 @@ async fn backdate_last_seen(
 /// reaper (`AppState::reap_idle_roomless_sessions`) treats it as stale.
 async fn backdate_session_connected_at(
     app: &toaster_talk_server::state::SharedAppState,
-    session_token: &str,
+    session_token: &toaster_talk_server::state::SessionToken,
     secs: u64,
 ) {
     let mut state = app.write().await;
@@ -90,7 +90,7 @@ async fn join_seat(
     store: &std::sync::Arc<tokio::sync::RwLock<toaster_talk_server::rooms::RoomStore>>,
     room_name: &str,
     member: &str,
-) -> String {
+) -> toaster_talk_server::state::SessionToken {
     let seat_token = {
         let mut s = store.write().await;
         s.create_seat(room_name, member, 0, common::TEST_MASTER_SECRET)
@@ -170,7 +170,7 @@ async fn test_fire_and_forget_is_one_way() {
     );
 
     // And the "ping" must still be waiting for bob — the send did not drain it.
-    let recv = handle_receive(&app, &store, bob, 0, None, None)
+    let recv = handle_receive(&app, &store, bob, 0, None, None, usize::MAX)
         .await
         .unwrap();
     assert_eq!(
@@ -240,7 +240,7 @@ async fn test_send_with_reply_gets_reply() {
 
     // Spawn bob: receive alice's message then send a reply.
     let bob_handle = tokio::spawn(async move {
-        let recv = handle_receive(&app2, &store2, bob.clone(), 5, None, None)
+        let recv = handle_receive(&app2, &store2, bob.clone(), 5, None, None, usize::MAX)
             .await
             .unwrap();
         assert!(
@@ -333,14 +333,14 @@ async fn test_four_member_exchange() {
     .await
     .unwrap();
 
-    let c_recv = handle_receive(&app, &store, c.clone(), 1, None, None)
+    let c_recv = handle_receive(&app, &store, c.clone(), 1, None, None, usize::MAX)
         .await
         .unwrap();
     assert_eq!(c_recv.timeout, Timeout::None);
     assert_eq!(c_recv.messages[0].from, "A");
     assert_eq!(c_recv.messages[0].body, "from-A");
 
-    let d_recv = handle_receive(&app, &store, d.clone(), 1, None, None)
+    let d_recv = handle_receive(&app, &store, d.clone(), 1, None, None, usize::MAX)
         .await
         .unwrap();
     assert_eq!(d_recv.timeout, Timeout::None);
@@ -377,14 +377,14 @@ async fn test_four_member_exchange() {
     .await
     .unwrap();
 
-    let a_recv = handle_receive(&app, &store, a, 1, None, None)
+    let a_recv = handle_receive(&app, &store, a, 1, None, None, usize::MAX)
         .await
         .unwrap();
     assert_eq!(a_recv.timeout, Timeout::None);
     assert_eq!(a_recv.messages[0].from, "C");
     assert_eq!(a_recv.messages[0].body, "from-C");
 
-    let b_recv = handle_receive(&app, &store, b, 1, None, None)
+    let b_recv = handle_receive(&app, &store, b, 1, None, None, usize::MAX)
         .await
         .unwrap();
     assert_eq!(b_recv.timeout, Timeout::None);
@@ -703,7 +703,16 @@ async fn test_receive_slot_preempted_when_handler_abandoned() {
     let store_clone = store.clone();
     let session_clone = session.clone();
     let handle = tokio::spawn(async move {
-        handle_receive(&app_clone, &store_clone, session_clone, 60, None, None).await
+        handle_receive(
+            &app_clone,
+            &store_clone,
+            session_clone,
+            60,
+            None,
+            None,
+            usize::MAX,
+        )
+        .await
     });
     // Give the task time to claim the receive slot and register its abort handle.
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -711,7 +720,7 @@ async fn test_receive_slot_preempted_when_handler_abandoned() {
 
     // A new receive must preempt the stale connection: abort the background sub-task,
     // claim a new generation, and return normally.
-    let result = handle_receive(&app, &store, session, 0, None, None).await;
+    let result = handle_receive(&app, &store, session, 0, None, None, usize::MAX).await;
     assert!(
         result.is_ok(),
         "receive must preempt abandoned connection and succeed: {result:?}"
@@ -809,7 +818,7 @@ async fn test_activity_slides_idle_window() {
     // Alice has been idle well past the TTL...
     backdate_last_seen(&app, "alice", 3600).await;
     // ...but she performs activity now — a 0s receive refreshes her last_seen.
-    handle_receive(&app, &store, alice.clone(), 0, None, None)
+    handle_receive(&app, &store, alice.clone(), 0, None, None, usize::MAX)
         .await
         .unwrap();
 
@@ -839,8 +848,9 @@ async fn test_idle_window_reanchors_on_blocking_call_completion() {
     let app2 = app.clone();
     let store2 = store.clone();
     let session2 = session.clone();
-    let recv =
-        tokio::spawn(async move { handle_receive(&app2, &store2, session2, 1, None, None).await });
+    let recv = tokio::spawn(async move {
+        handle_receive(&app2, &store2, session2, 1, None, None, usize::MAX).await
+    });
     tokio::time::sleep(Duration::from_millis(50)).await; // let it park
 
     // While she is parked, artificially backdate her last_seen far past the TTL.
@@ -971,7 +981,16 @@ async fn test_parked_seat_is_not_reaped() {
     let store_clone = store.clone();
     let session = alice.clone();
     let handle = tokio::spawn(async move {
-        handle_receive(&app_clone, &store_clone, session, 3600, None, None).await
+        handle_receive(
+            &app_clone,
+            &store_clone,
+            session,
+            3600,
+            None,
+            None,
+            usize::MAX,
+        )
+        .await
     });
     tokio::time::sleep(Duration::from_millis(20)).await; // let it claim the slot
 
@@ -1048,7 +1067,7 @@ async fn test_seat_reconnect_transfers_queued_messages() {
     .await
     .unwrap();
 
-    let result = handle_receive(&app, &store, session2, 0, None, None)
+    let result = handle_receive(&app, &store, session2, 0, None, None, usize::MAX)
         .await
         .unwrap();
     assert_eq!(
@@ -1126,7 +1145,7 @@ async fn test_connect_old_session_token_does_not_carry_over_queued_messages() {
     )
     .await
     .unwrap();
-    let result = handle_receive(&app, &store, session2, 0, None, None)
+    let result = handle_receive(&app, &store, session2, 0, None, None, usize::MAX)
         .await
         .unwrap();
     assert!(
@@ -1150,7 +1169,16 @@ async fn test_parked_receiver_is_not_idle_evicted() {
     let app_clone = app.clone();
     let store_clone = store.clone();
     let handle = tokio::spawn(async move {
-        handle_receive(&app_clone, &store_clone, session, 3600, None, None).await
+        handle_receive(
+            &app_clone,
+            &store_clone,
+            session,
+            3600,
+            None,
+            None,
+            usize::MAX,
+        )
+        .await
     });
     tokio::time::sleep(Duration::from_millis(20)).await; // let her claim the slot
 

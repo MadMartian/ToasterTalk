@@ -1,7 +1,7 @@
 use crate::{
     error::Error,
     rooms::RoomStore,
-    state::{MembershipCheck, SharedAppState},
+    state::{MemberName, MembershipCheck, SessionToken, SharedAppState},
     tools::session_id,
 };
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use tracing::info;
 #[derive(Debug)]
 pub struct LeaveResult {
     pub room_name: String,
-    pub member_name: String,
+    pub member_name: MemberName,
 }
 
 /// Voluntarily leave a room the caller's session has joined — the inverse of
@@ -26,7 +26,7 @@ pub struct LeaveResult {
 pub async fn handle_leave(
     app: &SharedAppState,
     store: &Arc<RwLock<RoomStore>>,
-    session_token: String,
+    session_token: SessionToken,
     room_name: String,
 ) -> Result<LeaveResult, Error> {
     let room_token = {
@@ -76,6 +76,7 @@ pub async fn handle_leave(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::mn;
     use crate::{
         rooms::RoomStore,
         state::AppState,
@@ -84,7 +85,14 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    async fn setup_room(dir: &TempDir) -> (SharedAppState, Arc<RwLock<RoomStore>>, String, String) {
+    async fn setup_room(
+        dir: &TempDir,
+    ) -> (
+        SharedAppState,
+        Arc<RwLock<RoomStore>>,
+        SessionToken,
+        MemberName,
+    ) {
         let store_path = dir.path().join("rooms.yaml");
         let mut store = RoomStore::load(store_path).unwrap();
         let room = store
@@ -99,7 +107,7 @@ mod tests {
         handle_join_room_token(&app, &store, session.clone(), token, "alice".into())
             .await
             .unwrap();
-        (app, store, session, "alice".into())
+        (app, store, session, mn("alice"))
     }
 
     #[tokio::test]

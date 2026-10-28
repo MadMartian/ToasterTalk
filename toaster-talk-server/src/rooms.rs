@@ -1,4 +1,4 @@
-use crate::error::Error;
+use crate::{error::Error, state::MemberName};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,7 @@ use sha2::Sha256;
 use std::{collections::HashMap, path::PathBuf};
 pub use toaster_talk_common::sanitize_filename;
 use toaster_talk_common::{ct_bytes_eq, format_duration_secs, is_valid_room_name};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -25,22 +25,17 @@ pub struct RoomToken(pub String);
 #[serde(transparent)]
 pub struct SeatToken(pub String);
 
-macro_rules! impl_token_newtype {
+/// Read-only `str` views shared by every `String` newtype in the crate (room,
+/// seat, session tokens and member names). Deliberately omits `Display`, `Deref`
+/// and any `String` constructor: each newtype decides those for itself, because
+/// `SessionToken` must redact its `Display` and expose no implicit `&str`, and
+/// `MemberName` may only be built through its validating constructor.
+/// `Borrow<str>` lets `HashMap<T, _>` / `HashSet<T>` be queried with a `&str`.
+macro_rules! impl_str_newtype {
     ($t:ty) => {
         impl $t {
             pub fn as_str(&self) -> &str {
                 &self.0
-            }
-        }
-        impl std::ops::Deref for $t {
-            type Target = str;
-            fn deref(&self) -> &str {
-                &self.0
-            }
-        }
-        impl std::fmt::Display for $t {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt(f)
             }
         }
         impl AsRef<str> for $t {
@@ -61,6 +56,26 @@ macro_rules! impl_token_newtype {
         impl PartialEq<&str> for $t {
             fn eq(&self, other: &&str) -> bool {
                 self.0.as_str() == *other
+            }
+        }
+    };
+}
+pub(crate) use impl_str_newtype;
+
+/// `impl_str_newtype!` plus a transparent `Deref`/`Display` and an unchecked
+/// `From<String>` — the full surface for the room/seat token newtypes.
+macro_rules! impl_token_newtype {
+    ($t:ty) => {
+        impl_str_newtype!($t);
+        impl std::ops::Deref for $t {
+            type Target = str;
+            fn deref(&self) -> &str {
+                &self.0
+            }
+        }
+        impl std::fmt::Display for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
             }
         }
         impl From<String> for $t {
@@ -103,7 +118,7 @@ pub fn generate_seat_token(secret: &[u8], room_name: &str, member_name: &str) ->
 /// A persisted seat token entry within a room. Stored in `Room.seats`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberSeat {
-    pub member_name: String,
+    pub member_name: MemberName,
     pub created_at_secs: u64,
     pub expires_at_secs: u64,
 }
@@ -368,6 +383,12 @@ impl RoomStore {
     /// Create a new room. Token is HMAC-SHA256(master_secret, room_name).
     /// Returns the room definition including the generated token.
     /// The caller (CLI via mgmt socket) is responsible for writing the token file.
+    ///
+    /// Refuses with [`Error::RoomExists`] if a room of that name already exists:
+    /// the token is deterministic in the name, so a second create would land on
+    /// the same key and silently replace the live room — emptying its seats and
+    /// resetting its timestamps. Use [`RoomStore::create_or_replace`] to do that
+    /// deliberately.
     pub async fn create(
         &mut self,
         name: String,
@@ -375,11 +396,46 @@ impl RoomStore {
         max_rooms: usize,
         master_secret: &[u8],
     ) -> Result<Room, Error> {
+        self.create_inner(name, ttl_days, max_rooms, master_secret, false)
+            .await
+            .map(|(room, _)| room)
+    }
+
+    /// Create a room, replacing any existing room of the same name. A replaced
+    /// room loses all of its seats and gets fresh created/expiry timestamps; its
+    /// room token is unchanged (it is derived from the name). Returns the new
+    /// room and whether an existing room was replaced. Evicting the replaced
+    /// room's live members is the caller's job (the store holds no sessions).
+    pub async fn create_or_replace(
+        &mut self,
+        name: String,
+        ttl_days: u64,
+        max_rooms: usize,
+        master_secret: &[u8],
+    ) -> Result<(Room, bool), Error> {
+        self.create_inner(name, ttl_days, max_rooms, master_secret, true)
+            .await
+    }
+
+    async fn create_inner(
+        &mut self,
+        name: String,
+        ttl_days: u64,
+        max_rooms: usize,
+        master_secret: &[u8],
+        overwrite: bool,
+    ) -> Result<(Room, bool), Error> {
         if !is_valid_room_name(&name) {
             return Err(Error::InvalidRoomName(name));
         }
 
-        if self.rooms.len() >= max_rooms {
+        let existing = self.get_by_name(&name).map(|r| r.token.clone());
+        if existing.is_some() && !overwrite {
+            return Err(Error::RoomExists(name));
+        }
+
+        // A replacement does not grow the store, so it is exempt from the cap.
+        if existing.is_none() && self.rooms.len() >= max_rooms {
             return Err(Error::RoomLimitReached { max: max_rooms });
         }
 
@@ -399,12 +455,27 @@ impl RoomStore {
             seats: HashMap::new(),
         };
 
+        // Remove under the existing key too, in case it was keyed by a token
+        // derived from a since-rotated master secret.
+        let replaced = match existing {
+            Some(old_token) => self.rooms.remove(&old_token),
+            None => None,
+        };
         self.rooms.insert(token, room.clone());
         self.save().await?;
 
-        info!(room = %name, expires_in = room.expires_in(), "room created");
+        match &replaced {
+            Some(old) => warn!(
+                room = %name,
+                seats_dropped = old.seats.len(),
+                old_expires_at_secs = old.expires_at_secs,
+                expires_in = room.expires_in(),
+                "room replaced by explicit overwrite: all seats dropped, timestamps reset"
+            ),
+            None => info!(room = %name, expires_in = room.expires_in(), "room created"),
+        }
 
-        Ok(room)
+        Ok((room, replaced.is_some()))
     }
 
     // ── Delete ────────────────────────────────────────────────────────────────
@@ -452,11 +523,8 @@ impl RoomStore {
         ttl_days: u64,
         master_secret: &[u8],
     ) -> Result<(SeatToken, u64), Error> {
-        // Validate member name — same rules as tools::validate_member_name, shared
-        // via the common crate to break the rooms ← tools ← state ← rooms cycle.
-        if !toaster_talk_common::is_valid_member_name(member_name) {
-            return Err(Error::InvalidMemberName(member_name.to_string()));
-        }
+        // Validate the member name up front, before any room lookup.
+        let member = MemberName::new(member_name)?;
 
         let (seat_token, expires_at_secs) = {
             let room = self.room_mut_by_name(room_name)?;
@@ -486,7 +554,7 @@ impl RoomStore {
             room.seats.insert(
                 seat_token.clone(),
                 MemberSeat {
-                    member_name: member_name.to_string(),
+                    member_name: member,
                     created_at_secs: now,
                     expires_at_secs,
                 },
@@ -603,6 +671,24 @@ mod tests {
     use super::*;
     use crate::test_support::TEST_MASTER_SECRET;
     use tempfile::TempDir;
+
+    /// The `MemberName` newtype must not change the persisted seat YAML: the
+    /// member name is still a bare scalar, and that bare scalar loads back.
+    #[test]
+    fn test_member_seat_yaml_keeps_member_name_a_bare_string() {
+        let seat = MemberSeat {
+            member_name: crate::test_support::mn("alice"),
+            created_at_secs: 1,
+            expires_at_secs: 2,
+        };
+        let yaml = serde_yml::to_string(&seat).unwrap();
+        assert_eq!(
+            yaml,
+            "member_name: alice\ncreated_at_secs: 1\nexpires_at_secs: 2\n"
+        );
+        let back: MemberSeat = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(back.member_name, "alice");
+    }
 
     fn make_store(dir: &TempDir) -> RoomStore {
         RoomStore::load(dir.path().join("rooms.yaml")).unwrap()
@@ -730,6 +816,113 @@ mod tests {
             .unwrap();
         let err = store
             .create("room2".into(), 30, 1, TEST_MASTER_SECRET)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::error::Error::RoomLimitReached { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_create_refuses_existing_room_and_keeps_seats() {
+        // A second create of a live room's name must not replace it: the token
+        // is deterministic in the name, so a replace would empty its seats.
+        let dir = TempDir::new().unwrap();
+        let store_path = dir.path().join("rooms.yaml");
+        let mut store = RoomStore::load(store_path.clone()).unwrap();
+        let first = store
+            .create("myroom".into(), 30, 50, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+        let (seat_token, _) = store
+            .create_seat("myroom", "alice", 0, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+
+        let err = store
+            .create("myroom".into(), 1, 50, TEST_MASTER_SECRET)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, crate::error::Error::RoomExists(n) if n == "myroom"),
+            "expected RoomExists, got {err:?}"
+        );
+
+        let room = store.get_by_name("myroom").unwrap();
+        assert_eq!(room.created_at_secs, first.created_at_secs);
+        assert_eq!(room.expires_at_secs, first.expires_at_secs);
+        assert!(
+            store.seat_for_token(&seat_token).is_some(),
+            "seat must survive"
+        );
+
+        let reloaded = RoomStore::load(store_path).unwrap();
+        assert!(reloaded.seat_for_token(&seat_token).is_some());
+        assert_eq!(
+            reloaded.get_by_name("myroom").unwrap().expires_at_secs,
+            first.expires_at_secs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_or_replace_drops_seats_and_resets_expiry() {
+        let dir = TempDir::new().unwrap();
+        let store_path = dir.path().join("rooms.yaml");
+        let mut store = RoomStore::load(store_path.clone()).unwrap();
+        let first = store
+            .create("myroom".into(), 30, 50, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+        let (seat_token, _) = store
+            .create_seat("myroom", "alice", 0, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+
+        let (room, replaced) = store
+            .create_or_replace("myroom".into(), 1, 50, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+        assert!(replaced);
+        assert_eq!(room.token, first.token, "room token is name-derived");
+        assert!(room.expires_at_secs < first.expires_at_secs);
+        assert!(room.seats.is_empty());
+        assert!(store.seat_for_token(&seat_token).is_none());
+        assert_eq!(store.list().len(), 1);
+
+        let reloaded = RoomStore::load(store_path).unwrap();
+        assert!(reloaded.seat_for_token(&seat_token).is_none());
+        assert_eq!(
+            reloaded.get_by_name("myroom").unwrap().expires_at_secs,
+            room.expires_at_secs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_or_replace_new_room_reports_not_replaced() {
+        let dir = TempDir::new().unwrap();
+        let mut store = make_store(&dir);
+        let (_, replaced) = store
+            .create_or_replace("fresh".into(), 30, 50, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+        assert!(!replaced);
+        assert!(store.get_by_name("fresh").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_replace_at_room_limit_is_allowed() {
+        // Replacing does not grow the store, so it must not trip the cap.
+        let dir = TempDir::new().unwrap();
+        let mut store = make_store(&dir);
+        store
+            .create("room1".into(), 30, 1, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+        let (_, replaced) = store
+            .create_or_replace("room1".into(), 30, 1, TEST_MASTER_SECRET)
+            .await
+            .unwrap();
+        assert!(replaced);
+        let err = store
+            .create_or_replace("room2".into(), 30, 1, TEST_MASTER_SECRET)
             .await
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::RoomLimitReached { .. }));
